@@ -27,6 +27,8 @@ data class TerminalContainerStatus(
     val conflictingPaths: List<String> = emptyList(),
     /** 入口能力：该 rootfs 内是否检测到可用于进入容器的可执行文件。 */
     val entryCapability: EntryCapability = EntryCapability.UNKNOWN,
+    /** 静态推导出的"实际会选用的入口模板"标签，UI 可直接展示。 */
+    val entryTemplateLabel: String = "",
 ) {
     enum class State {
         /** 未配置：用户还没填路径 / 填了空字符串。 */
@@ -223,6 +225,12 @@ object TerminalContainerDetector {
 
         // 入口能力静态检测：只读 rootfs 里有没有 unshare/chroot/sh 用于真正进入容器。
         val entryCapability = detectEntryCapability(dir)
+        // 同时给出"运行期会实际选择哪条模板"的可读名称（和 ContainerEntry.probeEntryTemplate 的
+        // 选择逻辑保持一致），用于设置页直接展示。
+        val entryTemplateLabel = computeEntryTemplateLabel(
+            rootDirFile = dir,
+            entryCapability = entryCapability,
+        )
 
         val state = when {
             entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL ->
@@ -286,6 +294,7 @@ object TerminalContainerDetector {
             details = details,
             conflictingPaths = legacyPaths,
             entryCapability = entryCapability,
+            entryTemplateLabel = entryTemplateLabel,
         )
     }
 
@@ -351,5 +360,60 @@ object TerminalContainerDetector {
         // 标记为 NO_SHELL 太重了；退化为 CHROOT_ONLY 语义（命令执行阶段会给出缺工具
         // 的明确错误），避免检测器和执行器两套判定差得太多。
         return TerminalContainerStatus.EntryCapability.CHROOT_ONLY
+    }
+
+    /**
+     * 按照 [ContainerEntry.probeEntryTemplate] 同样的选择逻辑，静态生成一个 UI 可读的
+     * "运行期实际入口模板"标签，这样设置页不用去构造 Terminal/会话，也能准确告诉用户
+     * 最终会用 unshare 还是 chroot。
+     */
+    private fun computeEntryTemplateLabel(
+        rootDirFile: File,
+        entryCapability: TerminalContainerStatus.EntryCapability,
+    ): String {
+        if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+            return "错误提示（缺入口文件）"
+        }
+        val hostHas = { name: String ->
+            val candidates = System.getenv("PATH")
+                .orEmpty()
+                .split(':')
+                .filter { it.isNotEmpty() }
+                .plus(
+                    listOf(
+                        "/system/bin",
+                        "/system/xbin",
+                        "/vendor/bin",
+                        "/sbin",
+                        "/product/bin",
+                        "/apex/com.android.runtime/bin",
+                    )
+                )
+                .distinct()
+            candidates.any { dir ->
+                runCatching {
+                    val f = File(dir, name)
+                    f.isFile && f.canExecute()
+                }.getOrDefault(false)
+            }
+        }
+        val containerHas = { rel: String ->
+            val f = File(rootDirFile, rel.removePrefix("/"))
+            runCatching { f.exists() && f.canExecute() || (f.isFile && f.canRead()) }.getOrDefault(false)
+        }
+        if (containerHas("/bin/unshare") || hostHas("unshare")) {
+            val bin = if (hostHas("unshare")) "宿主 unshare" else "容器 /bin/unshare"
+            return "unshare namespace 根切换（$bin）"
+        }
+        val chrootBin = when {
+            hostHas("chroot") -> "宿主 chroot"
+            containerHas("/usr/sbin/chroot") -> "容器 /usr/sbin/chroot"
+            containerHas("/bin/chroot") -> "容器 /bin/chroot"
+            else -> null
+        }
+        if (chrootBin != null && containerHas("/bin/sh")) {
+            return "chroot（$chrootBin）"
+        }
+        return "入口未就绪（将以错误提示形式返回）"
     }
 }

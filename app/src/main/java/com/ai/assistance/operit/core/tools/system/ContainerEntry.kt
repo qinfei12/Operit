@@ -327,8 +327,11 @@ object ContainerEntry {
             append(" 请确认该目录为 Droidspaces 构建的完整 Linux rootfs，并安装基础 busybox/coreutils。")
         }
         AppLogger.w(TAG, "probeEntryTemplate: NO_ENTRY_AVAILABLE $reason")
+        // 注意：错误模板不能再引用容器内 /bin/sh（否则如果那路径本身就不存在，整条命令会失败成
+        // "sh: /bin/sh: No such file or directory"，用户看不到我们辛苦收集的原因）。
+        // 直接用宿主 sh（一定存在）echo 原因到 stderr，并以非 0 退出。
         return EntryTemplate(
-            template = "{ROOT_CHROOT_PREFIX}/bin/sh -lc 'echo ${shellQuote(reason)} 1>&2; exit 23'",
+            template = "sh -lc 'echo ${shellQuote(reason)} 1>&2; exit 23'",
             needRoot = false,
             source = "NO_ENTRY_AVAILABLE",
         )

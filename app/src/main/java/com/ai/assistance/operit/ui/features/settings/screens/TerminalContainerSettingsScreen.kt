@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,11 +52,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.core.tools.system.AndroidPermissionLevel
 import com.ai.assistance.operit.core.tools.system.TerminalContainerDetector
@@ -125,6 +129,29 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
     fun rerunDetection(rootDir: String) {
         detection = TerminalContainerDetector.detectFor(context, rootDir)
         runtimePermission = TerminalContainerDetector.detectRuntimePermission(context)
+    }
+
+    // 用户跳转到 Shell 权限设置页切换了首选级别 / 启动了 Shizuku / 授权 Root 后回来，
+    // 需要把 runtimePermission 重新拉一遍，避免页面一直显示旧状态。
+    // 同时根目录检测也顺带刷新一次（万一用户在 Droidspaces 里创建了新子目录）。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                AppLogger.d(TAG, "ON_RESUME: refresh container detection + runtime permission")
+                runCatching {
+                    // 若用户曾保存过，以 savedRootDir 为准；否则以当前输入为候选
+                    val dirToCheck = savedRootDir.ifBlank { rootDirInput.trim() }
+                    rerunDetection(dirToCheck)
+                }.onFailure { err ->
+                    AppLogger.w(TAG, "ON_RESUME rerunDetection failed", err)
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     Scaffold(
@@ -412,7 +439,11 @@ private fun DetectionCard(
                 Spacer(Modifier.height(4.dp))
                 Divider()
                 Spacer(Modifier.height(4.dp))
-                EntryAndPermissionRow(entry = entry, runtimePermission = runtimePermission)
+                EntryAndPermissionRow(
+                    entry = entry,
+                    entryTemplateLabel = status.entryTemplateLabel,
+                    runtimePermission = runtimePermission,
+                )
             }
         }
     }
@@ -421,6 +452,7 @@ private fun DetectionCard(
 @Composable
 private fun EntryAndPermissionRow(
     entry: TerminalContainerStatus.EntryCapability,
+    entryTemplateLabel: String,
     runtimePermission: RuntimePermissionStatus?,
 ) {
     val (entryTitle, entryDesc, entryOk) = when (entry) {
@@ -457,6 +489,16 @@ private fun EntryAndPermissionRow(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        // 静态模拟 ContainerEntry 实际会选的入口形态：unshare/chroot/缺…，并标明是宿主还是容器侧的二进制。
+        // 这样用户不用真的跑命令也能一眼知道"命令会怎么进入容器"。
+        if (entryTemplateLabel.isNotBlank()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = "运行期会使用：$entryTemplateLabel",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         if (runtimePermission != null) {
             Spacer(Modifier.height(4.dp))
@@ -477,21 +519,55 @@ private fun EntryAndPermissionRow(
                     },
                 )
             }
+            val rawReason = runtimePermission.reason?.trim().orEmpty()
             val permHint = when {
-                runtimePermission.granted -> null
+                runtimePermission.granted -> when (runtimePermission.level) {
+                    AndroidPermissionLevel.STANDARD ->
+                        "当前已按普通应用权限级别授予。注意：STANDARD 即使【已授予】也无法真的 chroot/unshare 进入容器，仍需在 Shell 权限设置里切到 ROOT 或 Shizuku（DEBUGGER）。"
+                    AndroidPermissionLevel.DEBUGGER ->
+                        "Shizuku（DEBUGGER）权限已可用，命令将以 Shizuku debugger 身份执行，通常能成功进入容器。"
+                    AndroidPermissionLevel.ROOT ->
+                        "Root（su）权限已可用，命令将以 root 身份执行，可以真的 unshare/chroot 进入容器。"
+                    AndroidPermissionLevel.ADMIN ->
+                        "ADMIN（设备所有者）权限已授予。注意：该级别通常仍不足以真的 unshare/chroot 进入容器，请考虑使用 ROOT 或 Shizuku（DEBUGGER）。"
+                    AndroidPermissionLevel.ACCESSIBILITY ->
+                        "无障碍权限已授予。注意：ACCESSIBILITY 级别不能执行 chroot/unshare，请在 Shell 权限设置里切到 ROOT 或 Shizuku（DEBUGGER）。"
+                }
                 runtimePermission.level == AndroidPermissionLevel.STANDARD ->
                     "当前仅普通应用权限，无法真的 chroot/unshare 进入容器。请在 Shell 权限设置里切换到 ROOT 或 Shizuku（DEBUGGER）。"
                 runtimePermission.level == AndroidPermissionLevel.DEBUGGER ->
-                    "Shizuku 未启动或未授予 Operit 权限，按提示启动 Shizuku 后再回到此页重新检测。"
+                    buildString {
+                        append("Shizuku 未启动或未授予 Operit 权限。")
+                        if (rawReason.isNotEmpty()) append("原因：").append(rawReason)
+                        else append("按提示启动 Shizuku 后回到此页重新检测。")
+                    }
                 runtimePermission.level == AndroidPermissionLevel.ROOT ->
-                    "Root (su) 未授权或当前设备不支持 Root。如果使用 Shizuku，请改为 DEBUGGER 级别。"
-                else -> runtimePermission.reason?.trim()?.ifEmpty { null }
+                    buildString {
+                        append("Root (su) 未授权或当前设备不支持 Root。")
+                        if (rawReason.isNotEmpty()) append("原因：").append(rawReason)
+                        else append("如果使用 Shizuku，请改为 DEBUGGER 级别。")
+                    }
+                runtimePermission.level == AndroidPermissionLevel.ADMIN ->
+                    buildString {
+                        append("ADMIN（设备所有者）权限未授予或不可用。")
+                        if (rawReason.isNotEmpty()) append("原因：").append(rawReason)
+                        else append("ADMIN 不适合进入容器，建议改用 ROOT 或 DEBUGGER。")
+                    }
+                runtimePermission.level == AndroidPermissionLevel.ACCESSIBILITY ->
+                    buildString {
+                        append("无障碍服务未启用或未授予。")
+                        if (rawReason.isNotEmpty()) append("原因：").append(rawReason)
+                        else append("ACCESSIBILITY 不适用于进入容器，建议改用 ROOT 或 DEBUGGER。")
+                    }
+                else -> rawReason.ifEmpty { "当前首选级别 ${runtimePermission.levelLabel} 未授权。建议改为 ROOT 或 DEBUGGER(Shizuku)。" }
             }
-            permHint?.let {
+            permHint.let {
                 Text(
                     text = it,
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFFBF6F00),
+                    color = if (runtimePermission.granted &&
+                        (runtimePermission.level == AndroidPermissionLevel.ROOT || runtimePermission.level == AndroidPermissionLevel.DEBUGGER)
+                    ) MaterialTheme.colorScheme.tertiary else Color(0xFFBF6F00),
                 )
             }
         }
