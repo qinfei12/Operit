@@ -302,6 +302,53 @@ internal object ContainerEntry {
             else -> "/bin/sh"
         }
 
+        // 0) 最高优先级：Droidspaces CLI 入口（droidspaces --name=<container> run <cmd>）。
+        //    适用两种情况：
+        //    a. 宿主管得到 droidspaces 二进制（Droidspaces APP 首次安装后就在
+        //       /data/local/Droidspaces/bin/droidspaces），并且
+        //    b. 能从 rootDir 路径反推出容器名（rootDir 形如 /mnt/Droidspaces/<name>
+        //       或 basename 本身看起来像发行版名）。
+        //    这条路对目录型 rootfs 和 Sparse Image 都管用——因为 Droidspaces 自己管理
+        //    loop 挂载 / namespace / 根切换，Operit 就不用再去猜 unshare/chroot 哪个能跑。
+        val dsCli = File(TerminalContainerDetector.DROIDSPACES_HOST_BIN)
+        val dsCliExists = runCatching { dsCli.exists() }.getOrDefault(false)
+        val dsName = TerminalContainerDetector.inferDroidspacesContainerName(rootDir)
+            .ifBlank {
+                // fallback：rootDir basename 看起来像发行版就直接当容器名
+                rootFile.name.takeIf {
+                    TerminalContainerDetector.KNOWN_DROIDSPACES_DISTRO_DIRS.any { prefix ->
+                        it.lowercase().startsWith(prefix)
+                    }
+                }.orEmpty()
+            }
+        if (dsCliExists && dsName.isNotBlank()) {
+            AppLogger.d(
+                TAG,
+                "probeEntryTemplate: pick DROIDSPACES_CLI name=$dsName, dsCli=${dsCli.absolutePath}"
+            )
+            // 关于 cwd：
+            //   droidspaces run --help 里并没有显式的工作目录参数（文档只写了
+            //   `Execute a single command without opening a full shell`）。
+            //   所以我们把"切到 cwd"动作直接放进 shell 字符串里，即：
+            //     droidspaces --name=X run sh -lc 'cd CWD || true; CMD'
+            //   这样 cwd=逻辑容器内路径 就完全透明地在容器内部生效，不需要让
+            //   droidspaces 支持额外 flag。
+            // 注：dsName 由 inferDroidspacesContainerName 反推，来源是路径 basename，
+            // 且通过 looksLikeKnownDistroName 限定到字母数字 / - / _ / .，已经是
+            // shell-safe 的字符集，直接拼 `--name=` 后即可。
+            return EntryTemplate(
+                template = buildString {
+                    append(TerminalContainerDetector.DROIDSPACES_HOST_BIN)
+                    append(" --name=")
+                    append(dsName)
+                    append(" run sh -lc ")
+                    append("'cd {CWD} || true; {CMD}'")
+                },
+                needRoot = true,
+                source = "DROIDSPACES_CLI(name=$dsName)",
+            )
+        }
+
         // 1) unshare 优先（真 namespace 隔离，再 chroot 进 rootfs）。
         // 必须同时有 shell 才能进入容器执行命令。
         if (hasUnshare && hasSh) {
@@ -354,13 +401,19 @@ internal object ContainerEntry {
             append(" bin/sh=${containerFileExists(rootFile, "/bin/sh")},")
             append(" usr/bin/sh=${containerFileExists(rootFile, "/usr/bin/sh")});")
             append(" unshare=${hasUnshare};")
-            append(" chroot=$chrootBin。")
-            if (!hasSh) {
+            append(" chroot=$chrootBin;")
+            append(" droidspacesCli=${dsCliExists},droidspacesName=${dsName.ifBlank { "N/A" }}.")
+            if (dsCliExists && dsName.isBlank()) {
+                append(" 已检测到 Droidspaces 宿主二进制，但无法反推出容器名。")
+                append(" 请把容器目录选到 /mnt/Droidspaces/<你的容器名>/，")
+                append("或者在容器向导里使用 Ubuntu26 / debian12 这类能识别的名称。")
+            } else if (!hasSh) {
                 append(" 请在 Droidspaces 向导中选择「目录型 rootfs」完成完整安装，")
                 append("不要选到容器镜像的父目录或 /mnt/Droidspaces/ 本身。")
             } else {
                 append(" 请确认 Shell 执行器的权限级别至少是 ROOT 或 DEBUGGER(Shizuku)，")
                 append("以便 unshare/chroot 能成功发起系统调用。")
+                append(" 或者改用 Droidspaces Sparse Image 模式并保证 Droidspaces APP 已完成首次安装。")
             }
         }
         AppLogger.w(TAG, "probeEntryTemplate: NO_ENTRY_AVAILABLE $reason")

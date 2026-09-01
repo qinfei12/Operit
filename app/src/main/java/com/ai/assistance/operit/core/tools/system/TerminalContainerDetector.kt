@@ -29,6 +29,20 @@ data class TerminalContainerStatus(
     val entryCapability: EntryCapability = EntryCapability.UNKNOWN,
     /** 静态推导出的"实际会选用的入口模板"标签，UI 可直接展示。 */
     val entryTemplateLabel: String = "",
+    /**
+     * 从 rootDir 静态反推得到的"Droidspaces 容器名"候选：
+     *   - 当 rootDir 形如 `{DROIDSPACES_PARENT}/<name>` 且 `<name>` 像发行版时 → `<name>`
+     *   - 当 rootDir 内检测到 rootfs.img（Sparse Image / ext4 镜像）时也启用
+     * ContainerEntry 会优先用这个名字调用 `droidspaces --name=... run`。
+     * 空字符串表示未能识别。
+     */
+    val droidspacesContainerName: String = "",
+    /** `/data/local/Droidspaces/bin/droidspaces` 是否可用（宿主有这个二进制且可读）。 */
+    val droidspacesCliAvailable: Boolean = false,
+    /** true = 配置的目录里不含有 etc/usr/var/bin 等 rootfs marker，但有
+     * `rootfs.img` 或容器目录结构与 Droidspaces Sparse Image 布局一致。
+     * 这种情况下必须通过 Droidspaces CLI 进入，unshare/chroot 直接用会失败。 */
+    val droidspacesImageModeOnly: Boolean = false,
 ) {
     enum class State {
         /** 未配置：用户还没填路径 / 填了空字符串。 */
@@ -133,6 +147,26 @@ object TerminalContainerDetector {
         "void",
     )
 
+    /** Droidspaces 宿主端二进制位置（Android 安装向导里 Atomic Installation 会装到这里）。 */
+    const val DROIDSPACES_HOST_BIN = "/data/local/Droidspaces/bin/droidspaces"
+    /** Droidspaces 默认把所有容器（目录或镜像）都放在这一级目录下面。 */
+    const val DROIDSPACES_PARENT_DIR = "/mnt/Droidspaces"
+    /** Sparse Image 模式下目录内常见的文件名（app 自动命名，也可能用户自定义）。 */
+    private val DROIDSPACES_IMG_FILE_NAMES = setOf(
+        "rootfs.img",
+        "rootfs.sparse.img",
+        "rootfs.ext4.img",
+        "ubuntu.img",
+        "debian.img",
+        "arch.img",
+        "alpine.img",
+        "fedora.img",
+        "kali.img",
+        "manjaro.img",
+        "opensuse.img",
+        "void.img",
+    )
+
     private fun looksLikeKnownDistroName(dirName: String): Boolean {
         val lower = dirName.lowercase()
         if (lower in KNOWN_DROIDSPACES_DISTRO_DIRS) return true
@@ -141,6 +175,74 @@ object TerminalContainerDetector {
                 lower.removePrefix(prefix).all { ch -> ch.isDigit() || ch == '.' || ch == '-' || ch == '_' }
         }
     }
+
+    /**
+     * 从一个 rootDir 路径推导"Droidspaces 容器名"候选。
+     * 规则：当 rootDir 父目录是 /mnt/Droidspaces 时，basename 就是容器名（用户在向导里配置的名字）。
+     * 这对目录型和稀疏镜像型都成立。
+     */
+    internal fun inferDroidspacesContainerName(rootDir: String): String {
+        val trimmed = rootDir.trimEnd('/')
+        if (trimmed.isEmpty()) return ""
+        val parent = trimmed.substringBeforeLast('/')
+        val base = trimmed.substringAfterLast('/')
+        if (parent != DROIDSPACES_PARENT_DIR.trimEnd('/') && parent != DROIDSPACES_PARENT_DIR) {
+            // 不是直接挂在 Droidspaces 父目录下——也允许容器名本身看起来像发行版时
+            // 返回 basename（例如用户自己改成 /data/mnt/Ubuntu26，依然可用）。
+            if (looksLikeKnownDistroName(base)) return base
+            return ""
+        }
+        return base
+    }
+
+    /** 是否检测到宿主端有 droidspaces 二进制（不校验可执行位，避免非 root 误判）。 */
+    fun isDroidspacesCliAvailable(): Boolean {
+        val f = File(DROIDSPACES_HOST_BIN)
+        return runCatching { f.isFile && f.length() > 100_000L }.getOrDefault(false) ||
+            runCatching { f.exists() }.getOrDefault(false)
+    }
+
+    /** 判断一个目录是不是"Droidspaces 稀疏镜像模式"：不含 rootfs 标志目录，但含有 .img 文件。 */
+    private fun isDroidspacesImageModeDir(dir: File): Boolean {
+        val subs = runCatching { dir.listFiles()?.asList().orEmpty() }.getOrDefault(emptyList())
+        val noRootfsMarkers = listOf("etc", "usr", "var", "bin").none {
+            runCatching { File(dir, it).exists() }.getOrDefault(false)
+        }
+        val hasImage = subs.any { sub ->
+            val name = sub.name
+            if (!runCatching { sub.isFile }.getOrDefault(false)) return@any false
+            (name in DROIDSPACES_IMG_FILE_NAMES) ||
+                (name.endsWith(".img") && looksLikeKnownDistroName(
+                    name.removeSuffix(".img").removeSuffix(".sparse").removeSuffix(".ext4")
+                ))
+        }
+        return noRootfsMarkers && hasImage
+    }
+
+    /**
+     * Droidspaces 容器目录结构是"只要是 Droidspaces 管理的就允许选"。
+     * 这里返回 true 的条件：
+     *   ① 在 Droidspaces 父目录下 basename 看起来是发行版名 OR
+     *   ② 目录里能看到 Sparse Image 的 .img 文件 OR
+     *   ③ basename 本身是合法容器名（向导里用户自定义的）。
+     *
+     * detectFor 里会根据结果把 `looksLikeRootfs=false` 但
+     * `droidspacesImageModeOnly=true` 的情况从 MISSING 放宽到 OK/READ_ONLY。
+     */
+    private fun isPlausibleDroidspacesContainerDir(dir: File): Boolean {
+        val name = dir.name
+        val parent = dir.parentFile?.absolutePath?.trimEnd('/')
+        if (parent == DROIDSPACES_PARENT_DIR.trimEnd('/') && looksLikeKnownDistroName(name)) {
+            return true
+        }
+        if (looksLikeKnownDistroName(name) &&
+            runCatching { dir.canRead() }.getOrDefault(false)
+        ) {
+            return true
+        }
+        return isDroidspacesImageModeDir(dir)
+    }
+
 
     suspend fun detect(context: Context): TerminalContainerStatus {
         val prefs: TerminalContainerPreferences =
@@ -254,35 +356,62 @@ object TerminalContainerDetector {
             markerOk || hasInit || nameLooksLikeDistro
         }
 
+        // Droidspaces 模式识别：即使 looksLikeRootfs=false，如果目录看起来像
+        // 「Droidspaces Sparse Image 目录」或「Droidspaces 管理的容器目录」，
+        // 仍然放行，因为 ContainerEntry 会改走 droidspaces CLI。
+        val imageModeOnly = !looksLikeRootfs && isDroidspacesImageModeDir(dir)
+        val plausibleDsDir = !looksLikeRootfs && !imageModeOnly && isPlausibleDroidspacesContainerDir(dir)
+        val acceptedAsRootfs = looksLikeRootfs || imageModeOnly || plausibleDsDir
+
         // 写权限探测：不做写入兜底，仅在无法写入时标记 READ_ONLY 并提示。
-        val canWrite = runCatching {
-            val probe = File(dir, ".operit_write_probe_${System.nanoTime()}")
-            val created = try {
-                probe.createNewFile()
-            } catch (_: Throwable) {
-                false
-            }
-            if (created) runCatching { probe.delete() }
-            created
-        }.getOrDefault(false)
+        // 注意：Sparse Image 目录写权限其实不重要——写入发生在 droidspaces
+        // 管理的镜像内，Operit 在这里写 probe 只会因为目录权限缺而报 READ_ONLY。
+        // 所以对 imageModeOnly，我们把 canWrite 当作 true（因为 Operit 不需要在
+        // 这个目录里真的创建文件），避免给用户多余的「不可写」惊吓。
+        val canWrite = when {
+            imageModeOnly -> true
+            else -> runCatching {
+                val probe = File(dir, ".operit_write_probe_${System.nanoTime()}")
+                val created = try {
+                    probe.createNewFile()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (created) runCatching { probe.delete() }
+                created
+            }.getOrDefault(false)
+        }
 
         // 冲突检测：旧的内置 Ubuntu 路径是否仍然残留。
         val legacyPaths = collectLegacyRootfsPaths(context)
         val conflict = legacyPaths.isNotEmpty()
 
         // 入口能力静态检测：只读 rootfs 里有没有 unshare/chroot/sh 用于真正进入容器。
-        val entryCapability = detectEntryCapability(dir)
+        val entryCapability = if (imageModeOnly) {
+            // Sparse Image 目录里没有 /bin/sh /usr/bin/sh，走 unshare/chroot 永远
+            // 会失败，所以跳过 entryCapability，强制给一个「至少不是 NO_SHELL」的
+            // 中性值，这样状态机不会因为 NO_SHELL 的附加提示误导用户。
+            // ContainerEntry 会自己走 DROIDSPACES_CLI 分支。
+            TerminalContainerStatus.EntryCapability.CHROOT_ONLY
+        } else {
+            detectEntryCapability(dir)
+        }
+        val cliAvailable = isDroidspacesCliAvailable()
+        val dsName = inferDroidspacesContainerName(dirPath)
         // 同时给出"运行期会实际选择哪条模板"的可读名称（和 ContainerEntry.probeEntryTemplate 的
         // 选择逻辑保持一致），用于设置页直接展示。
         val entryTemplateLabel = computeEntryTemplateLabel(
             rootDirFile = dir,
             entryCapability = entryCapability,
+            droidspacesImageModeOnly = imageModeOnly,
+            droidspacesCliAvailable = cliAvailable,
+            droidspacesContainerName = dsName,
         )
 
         val state = when {
-            conflict && looksLikeRootfs && canWrite -> TerminalContainerStatus.State.CONFLICT
-            conflict && looksLikeRootfs -> TerminalContainerStatus.State.CONFLICT
-            !looksLikeRootfs -> TerminalContainerStatus.State.MISSING
+            conflict && acceptedAsRootfs && canWrite -> TerminalContainerStatus.State.CONFLICT
+            conflict && acceptedAsRootfs -> TerminalContainerStatus.State.CONFLICT
+            !acceptedAsRootfs -> TerminalContainerStatus.State.MISSING
             canWrite -> TerminalContainerStatus.State.OK
             else -> TerminalContainerStatus.State.READ_ONLY
         }
@@ -290,10 +419,18 @@ object TerminalContainerDetector {
         val userMessage = buildString {
             when (state) {
                 TerminalContainerStatus.State.OK -> {
-                    append("容器目录校验通过：$dirPath")
-                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
-                        append("｜但入口缺少 /bin/sh 或 /usr/bin/sh，")
-                        append("实际执行命令时会提示"无法进入容器"。请在 Droidspaces 里把 rootfs 完整安装好。")
+                    if (imageModeOnly) {
+                        append("检测到 Droidspaces Sparse Image 容器：$dirPath")
+                        append("（运行期会使用 droidspaces --name=$dsName run 来执行命令）。")
+                        if (!cliAvailable) {
+                            append("｜但宿主未检测到 droidspaces 二进制，请先打开 Droidspaces APP 完成首次引导安装。")
+                        }
+                    } else {
+                        append("容器目录校验通过：$dirPath")
+                        if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                            append("｜但入口缺少 /bin/sh 或 /usr/bin/sh，")
+                            append("实际执行命令时会提示"无法进入容器"。请在 Droidspaces 里把 rootfs 完整安装好。")
+                        }
                     }
                 }
                 TerminalContainerStatus.State.READ_ONLY -> {
@@ -305,41 +442,44 @@ object TerminalContainerDetector {
                 TerminalContainerStatus.State.CONFLICT -> {
                     append("检测到旧内置容器路径残留（${legacyPaths.size} 个），")
                     append("可能导致终端会话仍进入内置环境。请手动删除旧 rootfs 或确认不再混用。")
-                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL && !imageModeOnly) {
                         append("｜另外当前 Droidspaces 容器还缺少 /bin/sh。")
                     }
+                    if (imageModeOnly) append("｜当前为 Droidspaces Sparse Image 模式。")
                 }
                 TerminalContainerStatus.State.MISSING -> {
                     if (presentMarkers.isEmpty() &&
-                        entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL
+                        entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL &&
+                        !looksLikeKnownDistroName(dir.name)
                     ) {
-                        // 目录存在但既没有 marker 又找不到 shell —— 很大概率用户填的是
-                        // /mnt/Droidspaces/ 这个父目录，或者选到了 rootfs.img 所在的
-                        // 上层目录（里面只有稀疏镜像文件，不是 rootfs 本身）。
-                        append("目录里没有 bin / etc / usr / var / sbin/init 这些 rootfs 标志：$dirPath。")
-                        append("请确认选的是 Droidspaces 容器向导里配置的「目录型 rootfs」那个子目录；")
-                        append("如果是「Sparse Image / ext4 镜像」模式，不能直接读 .img 里的内容。")
-                    } else if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
-                        append("容器目录里找不到 /bin/sh：$dirPath。")
-                        append("请确认这是 Droidspaces 构建的完整 Linux rootfs（不是挂载点父目录）。")
+                        // 目录存在但既没有 marker 又找不到 shell 且 basename 不像发行版 ——
+                        // 大概率用户填的是 /mnt/Droidspaces/ 这个父目录。
+                        append("目录里没有 bin / etc / usr / var / sbin/init 或 .img 这些 rootfs/Droidspaces 标志：$dirPath。")
+                        append("请在它下面选择具体的发行版子目录（例如 /mnt/Droidspaces/Ubuntu26），")
+                        append("并注意「Sparse Image 模式」只需选到容器名所在目录即可。")
                     } else {
-                        append("目录存在但看起来不像 Linux rootfs：$dirPath")
+                        append("目录存在但仍无法识别：$dirPath")
                         val missing = (expectedMarkers - presentMarkers.toSet())
                         if (missing.isNotEmpty()) append("（缺少 ${missing.joinToString()}）")
-                        append("。")
+                        append("。如果这是 Droidspaces Sparse Image 模式的容器名目录，请确认里面有 rootfs.img，")
+                        append("或在 Droidspaces APP 里先把该容器启动一次。")
                     }
                 }
                 else -> append("$state: $dirPath")
             }
-            // 入口能力对 OK/CONFLICT/READ_ONLY 也给一段提示，方便 UI/向导把"为什么命令跑不起来"直接说出来。
-            val entryHint = when (entryCapability) {
-                TerminalContainerStatus.EntryCapability.NO_SHELL ->
+            // 入口能力对 OK/CONFLICT/READ_ONLY 也给一段提示。
+            val entryHint = when {
+                imageModeOnly -> {
+                    if (dsName.isBlank()) "镜像模式：尚未反推出 Droidspaces 容器名，运行期会用 basename 作为 fallback。"
+                    else "镜像模式：执行命令时会调用 `droidspaces --name=$dsName run ...`。"
+                }
+                entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL ->
                     "无法进入容器：缺少 /bin/sh。"
-                TerminalContainerStatus.EntryCapability.CHROOT_ONLY ->
+                entryCapability == TerminalContainerStatus.EntryCapability.CHROOT_ONLY ->
                     "入口方式：chroot（需要 ROOT/Shizuku debugger 权限）。"
-                TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE ->
+                entryCapability == TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE ->
                     "入口方式：unshare（需要 ROOT/Shizuku debugger 权限）。"
-                TerminalContainerStatus.EntryCapability.UNKNOWN -> ""
+                else -> ""
             }
             if (entryHint.isNotEmpty()) append("｜").append(entryHint)
         }
@@ -350,6 +490,10 @@ object TerminalContainerDetector {
             append(" canRead=").append(canRead)
             append(" canWrite=").append(canWrite)
             append(" entryCapability=").append(entryCapability.name)
+            append(" droidspacesCli=").append(cliAvailable)
+            append(" droidspacesName=").append(dsName)
+            append(" droidspacesImageMode=").append(imageModeOnly)
+            append(" plausibleDsDir=").append(plausibleDsDir)
             if (legacyPaths.isNotEmpty()) {
                 append(" legacyPaths=").append(legacyPaths.joinToString(";"))
             }
@@ -364,6 +508,9 @@ object TerminalContainerDetector {
             conflictingPaths = legacyPaths,
             entryCapability = entryCapability,
             entryTemplateLabel = entryTemplateLabel,
+            droidspacesContainerName = dsName,
+            droidspacesCliAvailable = cliAvailable,
+            droidspacesImageModeOnly = imageModeOnly,
         )
     }
 
@@ -458,7 +605,23 @@ object TerminalContainerDetector {
     private fun computeEntryTemplateLabel(
         rootDirFile: File,
         entryCapability: TerminalContainerStatus.EntryCapability,
+        droidspacesImageModeOnly: Boolean = false,
+        droidspacesCliAvailable: Boolean = false,
+        droidspacesContainerName: String = "",
     ): String {
+        // Droidspaces Sparse Image 模式 → 入口一定是 droidspaces CLI。
+        if (droidspacesImageModeOnly) {
+            if (droidspacesContainerName.isBlank()) {
+                return "Droidspaces CLI（镜像模式，basename fallback 作为 --name）"
+            }
+            val note = if (droidspacesCliAvailable) "已检测到 droidspaces 二进制" else "宿主未检测到 droidspaces，先运行 Droidspaces APP 完成首次安装"
+            return "Droidspaces CLI：droidspaces --name=$droidspacesContainerName run sh -lc \"...\"（$note）"
+        }
+        if (droidspacesContainerName.isNotBlank() && droidspacesCliAvailable) {
+            // 即使是目录型 rootfs，若已知 droidspaces 容器名，也优先提示 CLI（比
+            // unshare/chroot 更稳，Droidspaces 会处理自己的 loop mount、namespace）。
+            return "Droidspaces CLI（优先）：--name=$droidspacesContainerName；备选：unshare/chroot 直入目录"
+        }
         if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
             return "错误提示（缺入口文件）"
         }
