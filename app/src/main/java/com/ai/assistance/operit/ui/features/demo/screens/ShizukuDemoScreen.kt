@@ -674,7 +674,11 @@ fun ShizukuDemoScreen(
                     onOpenTerminalScreen = { 
                         // 跳转到TerminalSetup，直接显示配置界面
                         navigateTo?.invoke(Screen.TerminalSetup)
-                    }
+                    },
+                    onOpenContainerSettings = {
+                        navigateTo?.invoke(Screen.TerminalContainerSettings)
+                    },
+                    containerStatus = viewModel.containerStatus.value,
                 )
             }
         }

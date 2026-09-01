@@ -4150,6 +4150,7 @@
     <string name="screen_title_chat_history_settings">聊天记录管理</string>
     <string name="screen_title_chat_backup_settings">数据备份与恢复</string>
     <string name="screen_title_language_settings">语言设置</string>
+    <string name="screen_title_terminal_container">终端容器目录</string>
     <string name="screen_title_file_manager">文件管理器</string>
     <string name="screen_title_terminal">命令终端</string>
     <string name="screen_title_terminal_auto_config">终端自动配置</string>

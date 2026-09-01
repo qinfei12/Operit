@@ -54,7 +54,8 @@ fun SettingsScreen(
         navigateToWaifuModeSettings: () -> Unit,
         navigateToTokenUsageStatistics: () -> Unit,
         navigateToContextSummarySettings: () -> Unit,
-        navigateToLayoutAdjustmentSettings: () -> Unit
+        navigateToLayoutAdjustmentSettings: () -> Unit,
+        navigateToTerminalContainerSettings: () -> Unit,
 ) {
         val context = LocalContext.current
         val githubAuth = remember { GitHubAuthPreferences.getInstance(context) }
@@ -241,6 +242,21 @@ fun SettingsScreen(
                                 subtitle = stringResource(id = R.string.settings_context_summary_subtitle),
                                 icon = Icons.Default.Tune,
                                 onClick = navigateToContextSummarySettings
+                        )
+                }
+
+                // ======= 终端容器（Linux rootfs） =======
+                // 不再内置 Ubuntu/proot 容器，这里走用户自选目录（默认 /mnt/Droidspaces 下的发行版）
+                SettingsSection(
+                        title = "终端容器目录",
+                        icon = Icons.Default.Folder,
+                        containerColor = cardContainerColor
+                ) {
+                        CompactSettingsItem(
+                                title = "终端容器目录",
+                                subtitle = "选择 Droidspaces（或其他）构建的 Linux rootfs 目录，默认 /mnt/Droidspaces/",
+                                icon = Icons.Default.Folder,
+                                onClick = navigateToTerminalContainerSettings
                         )
                 }
 

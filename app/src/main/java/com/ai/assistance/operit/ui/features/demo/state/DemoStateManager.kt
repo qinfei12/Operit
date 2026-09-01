@@ -27,6 +27,8 @@ import androidx.lifecycle.viewModelScope
 import com.ai.assistance.operit.core.tools.system.AccessibilityProviderInstaller
 import com.ai.assistance.operit.core.tools.system.ShizukuAuthorizer
 import com.ai.assistance.operit.core.tools.system.Terminal
+import com.ai.assistance.operit.core.tools.system.TerminalContainerDetector
+import com.ai.assistance.operit.core.tools.system.TerminalContainerStatus
 import com.ai.assistance.operit.data.mcp.plugins.MCPSharedSession
 import com.ai.assistance.operit.R
 
@@ -45,6 +47,9 @@ class DemoStateManager(private val context: Context, private val coroutineScope:
     val isPnpmInstalled = mutableStateOf(false)
     val isPythonInstalled = mutableStateOf(false)
     val isNodejsPythonEnvironmentReady = mutableStateOf(false)
+
+    // 终端容器目录检测状态（代替旧的“OperitTerminal安装”判断）
+    val containerStatus: MutableState<TerminalContainerStatus?> = mutableStateOf(null)
 
     // Shizuku state change listeners
     private val shizukuListener: () -> Unit = { refreshStatus() }
@@ -255,8 +260,29 @@ class DemoStateManager(private val context: Context, private val coroutineScope:
                 _uiState.value.showShizukuWizard.value = true
             }
 
-            // Check OperitTerminal status
-            refreshNodejsPythonEnvironment()
+            // 先检测容器目录状态，再决定是否进入 pnpm/pip 检查。
+            // 这样避免在容器未就绪时也去刷会话，导致 createSession 抛错（虽然我们会 catch）。
+            val detected = runCatching { TerminalContainerDetector.detect(context) }
+                .onFailure { AppLogger.w(TAG, "容器目录检测异常", it) }
+                .getOrNull()
+            containerStatus.value = detected
+            val containerReady = detected?.isReadyForUse == true
+
+            // 容器未就绪 / 冲突时，显示终端容器向导卡片（替代旧 OperitTerminal 安装提示）。
+            if (detected == null || !containerReady ||
+                detected.state == TerminalContainerStatus.State.CONFLICT
+            ) {
+                _uiState.value.isOperitTerminalInstalled.value = false
+                _uiState.value.showOperitTerminalWizard.value = true
+                isPnpmInstalled.value = false
+                isPythonInstalled.value = false
+                isNodejsPythonEnvironmentReady.value = false
+            } else {
+                _uiState.value.isOperitTerminalInstalled.value = true
+                _uiState.value.showOperitTerminalWizard.value = false
+                // Check OperitTerminal status (pnpm / pip 实际可用检查)
+                refreshNodejsPythonEnvironment()
+            }
 
             // 延迟300ms以确保UI能够刷新
             delay(300)

@@ -4208,6 +4208,7 @@
     <string name="screen_title_chat_history_settings">Chat History Management</string>
     <string name="screen_title_chat_backup_settings">Data Backup &amp; Restore</string>
     <string name="screen_title_language_settings">Language Settings</string>
+    <string name="screen_title_terminal_container">Terminal Container Directory</string>
     <string name="screen_title_file_manager">File Manager</string>
     <string name="screen_title_terminal">Command Terminal</string>
     <string name="screen_title_terminal_auto_config">Terminal Auto Configuration</string>

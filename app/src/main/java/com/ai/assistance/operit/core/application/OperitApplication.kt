@@ -41,6 +41,7 @@ import com.ai.assistance.operit.data.preferences.ExternalHttpApiPreferences
 import com.ai.assistance.operit.data.preferences.UserPreferencesManager
 import com.ai.assistance.operit.data.preferences.WakeWordPreferences
 import com.ai.assistance.operit.data.preferences.initAndroidPermissionPreferences
+import com.ai.assistance.operit.data.preferences.initTerminalContainerPreferences
 import com.ai.assistance.operit.data.preferences.initUserPreferencesManager
 import com.ai.assistance.operit.data.preferences.preferencesManager
 import com.ai.assistance.operit.data.repository.CustomEmojiRepository
@@ -126,6 +127,7 @@ class OperitApplication : Application(), ImageLoaderFactory, WorkConfiguration.P
         // Workers and receivers can cold-start the process without creating an Activity.
         // Initialize process-wide preference dependencies before those entry points can run.
         initAndroidPermissionPreferences(applicationContext)
+        initTerminalContainerPreferences(applicationContext)
 
         configureOpenMpEnvironment()
         Thread.setDefaultUncaughtExceptionHandler(GlobalExceptionHandler(this))

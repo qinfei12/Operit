@@ -61,6 +61,7 @@ import com.ai.assistance.operit.ui.features.settings.screens.ModelPromptsSetting
 import com.ai.assistance.operit.ui.features.settings.screens.TagMarketScreen
 import com.ai.assistance.operit.ui.features.settings.screens.SettingsScreen
 import com.ai.assistance.operit.ui.features.settings.screens.SpeechServicesSettingsScreen
+import com.ai.assistance.operit.ui.features.settings.screens.TerminalContainerSettingsScreen
 import com.ai.assistance.operit.ui.features.settings.screens.ThemeSettingsScreen
 import com.ai.assistance.operit.ui.features.settings.screens.ToolPermissionSettingsScreen
 import com.ai.assistance.operit.ui.features.settings.screens.MnnModelDownloadScreen
@@ -616,7 +617,8 @@ sealed class Screen(
                     navigateToWaifuModeSettings = { navigateTo(WaifuModeSettings) },
                     navigateToTokenUsageStatistics = { navigateTo(TokenUsageStatistics) },
                     navigateToContextSummarySettings = { navigateTo(ContextSummarySettings) },
-                    navigateToLayoutAdjustmentSettings = { navigateTo(LayoutAdjustmentSettings) }
+                    navigateToLayoutAdjustmentSettings = { navigateTo(LayoutAdjustmentSettings) },
+                    navigateToTerminalContainerSettings = { navigateTo(TerminalContainerSettings) }
             )
         }
     }
@@ -1063,6 +1065,22 @@ sealed class Screen(
                 onGestureConsumed: (Boolean) -> Unit
         ) {
             LayoutAdjustmentSettingsScreen(onNavigateBack = onGoBack)
+        }
+    }
+
+    data object TerminalContainerSettings :
+        Screen(navItem = NavItem.Settings, titleRes = R.string.screen_title_terminal_container) {
+        @Composable
+        override fun Content(
+            navController: NavController,
+            navigateTo: ScreenNavigationHandler,
+            onGoBack: () -> Unit,
+            hasBackgroundImage: Boolean,
+            onLoading: (Boolean) -> Unit,
+            onError: (String) -> Unit,
+            onGestureConsumed: (Boolean) -> Unit
+        ) {
+            TerminalContainerSettingsScreen(onBackPressed = onGoBack)
         }
     }
 

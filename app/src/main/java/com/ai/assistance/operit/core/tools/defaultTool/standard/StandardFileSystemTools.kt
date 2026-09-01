@@ -3526,15 +3526,25 @@ open class StandardFileSystemTools(protected val context: Context) {
         PathValidator.validateAndroidPath(sourcePath, tool.name, "source")?.let { return it }
         PathValidator.validateAndroidPath(zipPath, tool.name, "destination")?.let { return it }
 
-        val actualSourcePath = PathMapper.resolvePath(context, sourcePath, environment)
-        val actualZipPath = PathMapper.resolvePath(context, zipPath, environment)
-
         if (sourcePath.isBlank() || zipPath.isBlank()) {
             return ToolResult(
                 toolName = tool.name,
                 success = false,
                 result = StringResultData(""),
                 error = "Source and destination parameters are required"
+            )
+        }
+
+        val (actualSourcePath, actualZipPath) = try {
+            PathMapper.resolvePath(context, sourcePath, environment) to
+                PathMapper.resolvePath(context, zipPath, environment)
+        } catch (containerError: com.ai.assistance.operit.util.TerminalContainerNotReadyException) {
+            AppLogger.w(TAG, "zipFiles: container not ready, abort", containerError)
+            return ToolResult(
+                toolName = tool.name,
+                success = false,
+                result = StringResultData(""),
+                error = "容器目录未就绪：${containerError.reason}"
             )
         }
 
@@ -3683,15 +3693,25 @@ open class StandardFileSystemTools(protected val context: Context) {
         PathValidator.validateAndroidPath(zipPath, tool.name, "source")?.let { return it }
         PathValidator.validateAndroidPath(destPath, tool.name, "destination")?.let { return it }
 
-        val actualZipPath = PathMapper.resolvePath(context, zipPath, environment)
-        val actualDestPath = PathMapper.resolvePath(context, destPath, environment)
-
         if (zipPath.isBlank() || destPath.isBlank()) {
             return ToolResult(
                 toolName = tool.name,
                 success = false,
                 result = StringResultData(""),
                 error = "Source and destination parameters are required"
+            )
+        }
+
+        val (actualZipPath, actualDestPath) = try {
+            PathMapper.resolvePath(context, zipPath, environment) to
+                PathMapper.resolvePath(context, destPath, environment)
+        } catch (containerError: com.ai.assistance.operit.util.TerminalContainerNotReadyException) {
+            AppLogger.w(TAG, "unzipFiles: container not ready, abort", containerError)
+            return ToolResult(
+                toolName = tool.name,
+                success = false,
+                result = StringResultData(""),
+                error = "容器目录未就绪：${containerError.reason}"
             )
         }
 
@@ -4293,7 +4313,24 @@ open class StandardFileSystemTools(protected val context: Context) {
         val environment = tool.parameters.find { it.name == "environment" }?.value
         PathValidator.validateAndroidPath(destPath, tool.name, "destination")?.let { return it }
 
-        val actualDestPath = PathMapper.resolvePath(context, destPath, environment)
+        val actualDestPath = try {
+            PathMapper.resolvePath(context, destPath, environment)
+        } catch (containerError: com.ai.assistance.operit.util.TerminalContainerNotReadyException) {
+            AppLogger.w(TAG, "downloadFile: container not ready, abort", containerError)
+            return ToolResult(
+                toolName = tool.name,
+                success = false,
+                result =
+                FileOperationData(
+                    operation = "download",
+                    env = environment.orEmpty().trim().ifBlank { "android" },
+                    path = destPath,
+                    successful = false,
+                    details = "容器目录未就绪：${containerError.reason}"
+                ),
+                error = "容器目录未就绪：${containerError.reason}"
+            )
+        }
 
         fun parseHeaders(headersJson: String?): Map<String, String> {
             if (headersJson.isNullOrBlank()) return emptyMap()
