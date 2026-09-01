@@ -23,6 +23,8 @@ data class TerminalContainerStatus(
     val details: String,
     /** state=CONFLICT 时可能携带的疑似内置容器路径 */
     val conflictingPaths: List<String> = emptyList(),
+    /** 入口能力：该 rootfs 内是否检测到可用于进入容器的可执行文件。 */
+    val entryCapability: EntryCapability = EntryCapability.UNKNOWN,
 ) {
     enum class State {
         /** 未配置：用户还没填路径 / 填了空字符串。 */
@@ -37,6 +39,17 @@ data class TerminalContainerStatus(
         OK,
         /** 疑似冲突：检测到旧的内置 rootfs 路径仍然存在，需要提醒用户。 */
         CONFLICT,
+    }
+
+    /** rootfs 内入口文件的可用性（只是静态检测，不代表当前权限足够真的执行）。 */
+    enum class EntryCapability {
+        UNKNOWN,
+        /** 连 /bin/sh 都没有，肯定无法进入。 */
+        NO_SHELL,
+        /** 只有 chroot 可用（需要 ROOT）。 */
+        CHROOT_ONLY,
+        /** unshare + /bin/sh 都在（需要 ROOT，优先用）。 */
+        UNSHARE_AVAILABLE,
     }
 
     val isReadyForUse: Boolean
@@ -150,7 +163,12 @@ object TerminalContainerDetector {
         val legacyPaths = collectLegacyRootfsPaths(context)
         val conflict = legacyPaths.isNotEmpty()
 
+        // 入口能力静态检测：只读 rootfs 里有没有 unshare/chroot/sh 用于真正进入容器。
+        val entryCapability = detectEntryCapability(dir)
+
         val state = when {
+            entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL ->
+                TerminalContainerStatus.State.MISSING
             conflict && looksLikeRootfs && canWrite -> TerminalContainerStatus.State.CONFLICT
             conflict && looksLikeRootfs -> TerminalContainerStatus.State.CONFLICT
             !looksLikeRootfs -> TerminalContainerStatus.State.MISSING
@@ -168,10 +186,27 @@ object TerminalContainerDetector {
                     append("检测到旧内置容器路径残留（${legacyPaths.size} 个），")
                     append("可能导致终端会话仍进入内置环境。请手动删除旧 rootfs 或确认不再混用。")
                 }
-                TerminalContainerStatus.State.MISSING ->
-                    append("目录存在但看起来不像 Linux rootfs：$dirPath（缺少 ${(expectedMarkers - presentMarkers.toSet()).joinToString()}）。")
+                TerminalContainerStatus.State.MISSING -> {
+                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                        append("容器目录里找不到 /bin/sh：$dirPath。")
+                        append("请确认这是 Droidspaces 构建的完整 Linux rootfs（不是挂载点父目录）。")
+                    } else {
+                        append("目录存在但看起来不像 Linux rootfs：$dirPath（缺少 ${(expectedMarkers - presentMarkers.toSet()).joinToString()}）。")
+                    }
+                }
                 else -> append("$state: $dirPath")
             }
+            // 入口能力对 OK/CONFLICT/READ_ONLY 也给一段提示，方便 UI/向导把"为什么命令跑不起来"直接说出来。
+            val entryHint = when (entryCapability) {
+                TerminalContainerStatus.EntryCapability.NO_SHELL ->
+                    "无法进入容器：缺少 /bin/sh。"
+                TerminalContainerStatus.EntryCapability.CHROOT_ONLY ->
+                    "入口方式：chroot（需要 ROOT/Shizuku debugger 权限）。"
+                TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE ->
+                    "入口方式：unshare（需要 ROOT/Shizuku debugger 权限）。"
+                TerminalContainerStatus.EntryCapability.UNKNOWN -> ""
+            }
+            if (entryHint.isNotEmpty()) append("｜").append(entryHint)
         }
 
         val details = buildString {
@@ -179,6 +214,7 @@ object TerminalContainerDetector {
             append(" markers=").append(presentMarkers.joinToString(","))
             append(" canRead=").append(canRead)
             append(" canWrite=").append(canWrite)
+            append(" entryCapability=").append(entryCapability.name)
             if (legacyPaths.isNotEmpty()) {
                 append(" legacyPaths=").append(legacyPaths.joinToString(";"))
             }
@@ -191,6 +227,7 @@ object TerminalContainerDetector {
             userMessage = userMessage,
             details = details,
             conflictingPaths = legacyPaths,
+            entryCapability = entryCapability,
         )
     }
 
@@ -234,5 +271,27 @@ object TerminalContainerDetector {
         )
         return candidates.filter { runCatching { it.exists() }.getOrDefault(false) }
             .map { it.absolutePath }
+    }
+
+    /**
+     * 静态检测该 rootfs 目录里可用的入口工具。
+     *
+     * 只看文件是否存在（不看是否有权限真的执行）；权限是否够用由 Terminal 实际执行时
+     * 再报错（"Operation not permitted" 等）。这样设置页就能清楚告诉用户"缺什么"。
+     */
+    private fun detectEntryCapability(rootDir: File): TerminalContainerStatus.EntryCapability {
+        val has = { rel: String ->
+            val f = File(rootDir, rel.removePrefix("/"))
+            runCatching { f.exists() }.getOrDefault(false)
+        }
+        if (!has("/bin/sh")) return TerminalContainerStatus.EntryCapability.NO_SHELL
+        if (has("/bin/unshare")) return TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE
+        if (has("/usr/sbin/chroot") || has("/bin/chroot")) {
+            return TerminalContainerStatus.EntryCapability.CHROOT_ONLY
+        }
+        // 有 sh 但找不到 unshare/chroot。这种情况下我们无法真的"切换根"，
+        // 标记为 NO_SHELL 太重了；退化为 CHROOT_ONLY 语义（命令执行阶段会给出缺工具
+        // 的明确错误），避免检测器和执行器两套判定差得太多。
+        return TerminalContainerStatus.EntryCapability.CHROOT_ONLY
     }
 }

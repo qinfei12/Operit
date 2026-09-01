@@ -146,6 +146,11 @@ class Terminal private constructor(private val context: Context) {
      *
      * 当容器目录未就绪时抛 [TerminalContainerNotReadyRuntimeException]。
      * 上层向导/工具需要 catch 该异常，并把 message 当作错误给用户/AI，不要崩溃。
+     *
+     * 在创建成功后，会立刻走 [ContainerEntry.prepareForSession] 探测本会话应使用的
+     * 容器入口模板（unshare/chroot）。之后所有 executeCommand 都会自动包一层"进入容器
+     * 再执行"，上层调用方（MCPDeployer/StandardTerminalCommandExecutor/ChatViewModel/...）
+     * 零改动。
      */
     suspend fun createSession(title: String? = null): String {
         ensureContainerReadyOrThrow("createSession")
@@ -158,6 +163,12 @@ class Terminal private constructor(private val context: Context) {
                 )
             }
             .getOrThrow()
+        runCatching { ContainerEntry.prepareForSession(context, newSession.id) }
+            .onFailure { err ->
+                // 探测失败不把整个 createSession 判失败，只记日志；后续 executeCommand 会
+                // 再调一次 prepareForSession，把错误以命令输出的形式返回给 AI/用户。
+                AppLogger.w(TAG, "createSession(${newSession.id}) probe entry failed", err)
+            }
         AppLogger.d(TAG, "Session ${newSession.id} initialized successfully")
         return newSession.id
     }
@@ -172,8 +183,11 @@ class Terminal private constructor(private val context: Context) {
 
     /**
      * 关闭终端会话
+     *
+     * 同时清理 ContainerEntry 缓存（会话级逻辑 cwd / 入口模板）。
      */
     fun closeSession(sessionId: String) {
+        runCatching { ContainerEntry.onSessionClosed(sessionId) }
         runCatching { terminalManager.closeSession(sessionId) }
             .onFailure { AppLogger.e(TAG, "closeSession($sessionId) failed", it) }
     }
@@ -184,6 +198,8 @@ class Terminal private constructor(private val context: Context) {
      * - 发送前检查容器状态，未就绪时抛 [TerminalContainerNotReadyRuntimeException]。
      * - 对底层执行错误进行 catch 并返回错误文案输出（非 null 字符串），而不是
      *   null，减少调用方到处判空崩溃。
+     * - **命令自动包一层容器入口**：通过 [ContainerEntry.wrapCommand] 把命令发送到
+     *   Droidspaces rootfs 内部执行。上层调用方零改动。
      */
     suspend fun executeCommand(sessionId: String, command: String): String? {
         try {
@@ -193,6 +209,22 @@ class Terminal private constructor(private val context: Context) {
             AppLogger.w(TAG, "executeCommand blocked: ${containerError.message}")
             return containerError.message
         }
+        val prepared = runCatching { ContainerEntry.prepareForSession(context, sessionId) }
+            .fold(
+                onSuccess = { it },
+                onFailure = { err ->
+                    val msg = "容器入口准备失败：${err.message ?: err::class.java.simpleName}"
+                    AppLogger.w(TAG, "executeCommand($sessionId): $msg", err)
+                    return msg
+                }
+            )
+        val wrapped = runCatching { ContainerEntry.wrapCommand(prepared, sessionId, command) }
+            .getOrElse { err ->
+                val msg = "命令包装失败：${err.message ?: err::class.java.simpleName}"
+                AppLogger.w(TAG, "executeCommand($sessionId): $msg", err)
+                return msg
+            }
+        AppLogger.d(TAG, "executeCommand($sessionId) wrap source=${prepared.template.source}")
         val deferred = CompletableDeferred<String>()
         val output = StringBuilder()
         var completionOutput: String? = null
@@ -227,7 +259,7 @@ class Terminal private constructor(private val context: Context) {
         }
 
         val sendResult = runCatching { collectorReady.await() }
-            .andThen { runCatching { terminalManager.sendCommandToSession(sessionId, command, commandId) } }
+            .andThen { runCatching { terminalManager.sendCommandToSession(sessionId, wrapped, commandId) } }
 
         if (sendResult.isFailure) {
             val error = sendResult.exceptionOrNull()
@@ -261,9 +293,30 @@ class Terminal private constructor(private val context: Context) {
             // 用反射式失败：把错误包装为重抛，由调用方 catch 并展示。
             throw IllegalStateException(containerError.message, containerError)
         }
+        val prepared = runCatching {
+            // executeHiddenCommand 通常是"一次性隐藏执行"，没有显式 sessionId。
+            // 用 executorKey + 一个全局虚拟 session 做缓存，避免每次都探测。
+            val virtualSessionId = "__hidden_$executorKey"
+            ContainerEntry.prepareForSession(context, virtualSessionId)
+        }.fold(
+            onSuccess = { it },
+            onFailure = { err ->
+                val msg = "隐藏命令入口准备失败：${err.message ?: err::class.java.simpleName}"
+                AppLogger.w(TAG, msg, err)
+                throw IllegalStateException(msg, err)
+            }
+        )
+        val wrapped = runCatching {
+            val virtualSessionId = "__hidden_$executorKey"
+            ContainerEntry.wrapCommand(prepared, virtualSessionId, command)
+        }.getOrElse { err ->
+            val msg = "隐藏命令包装失败：${err.message ?: err::class.java.simpleName}"
+            AppLogger.w(TAG, msg, err)
+            throw IllegalStateException(msg, err)
+        }
         return runCatching {
             terminalManager.executeHiddenCommand(
-                command = command,
+                command = wrapped,
                 executorKey = executorKey,
                 timeoutMs = timeoutMs
             )
@@ -281,6 +334,8 @@ class Terminal private constructor(private val context: Context) {
      * 返回命令执行过程中的所有事件，直到命令完成。
      *
      * 若容器未就绪，会直接 close(错误)，消费方应当 catch 而不是崩溃。
+     *
+     * 命令同样通过 [ContainerEntry] 自动包一层"进入 Droidspaces 容器再执行"。
      */
     fun executeCommandFlow(sessionId: String, command: String): Flow<CommandExecutionEvent> {
         return channelFlow {
@@ -295,6 +350,21 @@ class Terminal private constructor(private val context: Context) {
                 close(prepareError)
                 return@channelFlow
             }
+
+            val prepared = runCatching { ContainerEntry.prepareForSession(context, sessionId) }
+                .fold(
+                    onSuccess = { it },
+                    onFailure = { err ->
+                        AppLogger.w(TAG, "executeCommandFlow($sessionId) prepare failed", err)
+                        close(err as? Throwable ?: RuntimeException(err))
+                        return@channelFlow
+                    }
+                )
+            val wrapped = runCatching { ContainerEntry.wrapCommand(prepared, sessionId, command) }
+                .getOrElse { err ->
+                    close(err)
+                    return@channelFlow
+                }
 
             val collectorJob = launch {
                 runCatching {
@@ -317,7 +387,7 @@ class Terminal private constructor(private val context: Context) {
             // 先确保事件收集器就绪，再发送命令，避免快命令输出在订阅前丢失。
             runCatching {
                 collectorReady.await()
-                terminalManager.sendCommandToSession(sessionId, command, commandId)
+                terminalManager.sendCommandToSession(sessionId, wrapped, commandId)
             }.onFailure { error ->
                 AppLogger.e(TAG, "executeCommandFlow send failed", error)
                 if (!isClosedForSend) close(error)
