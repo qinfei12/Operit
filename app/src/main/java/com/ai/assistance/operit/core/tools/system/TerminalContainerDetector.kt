@@ -99,7 +99,16 @@ data class RuntimePermissionStatus(
 object TerminalContainerDetector {
     private const val TAG = "TerminalContainerDetector"
 
-    /** 默认 /mnt/Droidspaces 下常见子目录（Droidspaces 的发行版命名）。 */
+    /**
+     * 默认 /mnt/Droidspaces 下常见子目录（Droidspaces 的发行版命名）。
+     *
+     * 注意两点：
+     *   1) Droidspaces 允许用户在安装向导里给容器"名字"自由发挥，
+     *      所以扫描策略是"先列全部子目录，再按 rootfs marker 判断"，
+     *      这里的 KNOWN_* 只做"名字像但 marker 不全时也放行"的兜底。
+     *   2) Ubuntu 新版本命名通常不带空格，但用户可能用 Ubuntu26 / Ubuntu_26.04 这类写法，
+     *      因此除了精确列表，也做一个"前缀小写匹配 + 后缀可带版本号"的模糊判断。
+     */
     val KNOWN_DROIDSPACES_DISTRO_DIRS = listOf(
         "ubuntu",
         "debian",
@@ -111,6 +120,27 @@ object TerminalContainerDetector {
         "opensuse",
         "void",
     )
+    private val KNOWN_DROIDSPACES_PREFIXES = listOf(
+        "ubuntu",
+        "debian",
+        "arch",
+        "fedora",
+        "alpine",
+        "kali",
+        "manjaro",
+        "opensuse",
+        "suse",
+        "void",
+    )
+
+    private fun looksLikeKnownDistroName(dirName: String): Boolean {
+        val lower = dirName.lowercase()
+        if (lower in KNOWN_DROIDSPACES_DISTRO_DIRS) return true
+        return KNOWN_DROIDSPACES_PREFIXES.any { prefix ->
+            lower.startsWith(prefix) &&
+                lower.removePrefix(prefix).all { ch -> ch.isDigit() || ch == '.' || ch == '-' || ch == '_' }
+        }
+    }
 
     suspend fun detect(context: Context): TerminalContainerStatus {
         val prefs: TerminalContainerPreferences =
@@ -200,12 +230,29 @@ object TerminalContainerDetector {
             )
         }
 
-        // 基础 Linux rootfs 标志：/bin /etc /usr 中存在两个以上。
-        val expectedMarkers = listOf("bin", "etc", "usr")
+        // 基础 Linux rootfs 标志：
+        // 新版系统（usrmerge：Ubuntu 23.10+、Debian 12+、Fedora 36+）里 /bin /sbin /lib
+        // 都是指向 /usr 下对应目录的 symlink；而 /etc、/usr、/var 在所有发行版里都直接存在。
+        // 因此 marker 集用 usrmerge 友好的集合，并要求命中 2/4 就算通过。
+        val expectedMarkers = listOf("etc", "usr", "var", "bin")
         val presentMarkers = expectedMarkers.filter { marker ->
+            // File#exists() 默认会跟随 symlink；这对 usrmerge 的 /bin -> /usr/bin 正好够用。
             runCatching { File(dir, marker).exists() }.getOrDefault(false)
         }
-        val looksLikeRootfs = presentMarkers.size >= 2
+        val looksLikeRootfs = run {
+            // 常规发行版：命中 2+ 个 marker
+            val markerOk = presentMarkers.size >= 2
+            // Droidspaces 的稀疏镜像/目录型 rootfs 会有一个显式的 init 入口
+            // （官方 CLI `--rootfs=PATH` 要求 rootfs 含 `/sbin/init`）。
+            val hasInit = runCatching {
+                File(dir, "sbin/init").exists() ||
+                    File(dir, "init").exists()
+            }.getOrDefault(false)
+            // 容器名字本身就是发行版名（如 Ubuntu26），且至少有一个关键 marker，也放行
+            val nameLooksLikeDistro =
+                looksLikeKnownDistroName(dir.name) && presentMarkers.isNotEmpty()
+            markerOk || hasInit || nameLooksLikeDistro
+        }
 
         // 写权限探测：不做写入兜底，仅在无法写入时标记 READ_ONLY 并提示。
         val canWrite = runCatching {
@@ -233,8 +280,6 @@ object TerminalContainerDetector {
         )
 
         val state = when {
-            entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL ->
-                TerminalContainerStatus.State.MISSING
             conflict && looksLikeRootfs && canWrite -> TerminalContainerStatus.State.CONFLICT
             conflict && looksLikeRootfs -> TerminalContainerStatus.State.CONFLICT
             !looksLikeRootfs -> TerminalContainerStatus.State.MISSING
@@ -244,20 +289,44 @@ object TerminalContainerDetector {
 
         val userMessage = buildString {
             when (state) {
-                TerminalContainerStatus.State.OK ->
+                TerminalContainerStatus.State.OK -> {
                     append("容器目录校验通过：$dirPath")
-                TerminalContainerStatus.State.READ_ONLY ->
+                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                        append("｜但入口缺少 /bin/sh 或 /usr/bin/sh，")
+                        append("实际执行命令时会提示"无法进入容器"。请在 Droidspaces 里把 rootfs 完整安装好。")
+                    }
+                }
+                TerminalContainerStatus.State.READ_ONLY -> {
                     append("容器目录可读但无法写入：$dirPath。文件工具可读取，但写入/解压/安装命令会失败。")
+                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                        append("｜且入口缺少 /bin/sh。")
+                    }
+                }
                 TerminalContainerStatus.State.CONFLICT -> {
                     append("检测到旧内置容器路径残留（${legacyPaths.size} 个），")
                     append("可能导致终端会话仍进入内置环境。请手动删除旧 rootfs 或确认不再混用。")
+                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                        append("｜另外当前 Droidspaces 容器还缺少 /bin/sh。")
+                    }
                 }
                 TerminalContainerStatus.State.MISSING -> {
-                    if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
+                    if (presentMarkers.isEmpty() &&
+                        entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL
+                    ) {
+                        // 目录存在但既没有 marker 又找不到 shell —— 很大概率用户填的是
+                        // /mnt/Droidspaces/ 这个父目录，或者选到了 rootfs.img 所在的
+                        // 上层目录（里面只有稀疏镜像文件，不是 rootfs 本身）。
+                        append("目录里没有 bin / etc / usr / var / sbin/init 这些 rootfs 标志：$dirPath。")
+                        append("请确认选的是 Droidspaces 容器向导里配置的「目录型 rootfs」那个子目录；")
+                        append("如果是「Sparse Image / ext4 镜像」模式，不能直接读 .img 里的内容。")
+                    } else if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
                         append("容器目录里找不到 /bin/sh：$dirPath。")
                         append("请确认这是 Droidspaces 构建的完整 Linux rootfs（不是挂载点父目录）。")
                     } else {
-                        append("目录存在但看起来不像 Linux rootfs：$dirPath（缺少 ${(expectedMarkers - presentMarkers.toSet()).joinToString()}）。")
+                        append("目录存在但看起来不像 Linux rootfs：$dirPath")
+                        val missing = (expectedMarkers - presentMarkers.toSet())
+                        if (missing.isNotEmpty()) append("（缺少 ${missing.joinToString()}）")
+                        append("。")
                     }
                 }
                 else -> append("$state: $dirPath")
@@ -308,17 +377,29 @@ object TerminalContainerDetector {
         val parent = File(parentDir)
         if (!parent.exists() || !parent.isDirectory) return emptyList()
         val subs = runCatching { parent.listFiles()?.asList().orEmpty() }.getOrDefault(emptyList())
+        val markers = listOf("etc", "usr", "var", "bin")
+        val subMarkers = { sub: File ->
+            markers.count { marker ->
+                runCatching { File(sub, marker).exists() }.getOrDefault(false)
+            }
+        }
+        val hasInit = { sub: File ->
+            runCatching { File(sub, "sbin/init").exists() || File(sub, "init").exists() }
+                .getOrDefault(false)
+        }
         return subs
             .asSequence()
             .filter { it.isDirectory }
             .filter { sub ->
-                // 至少能读到
                 val readable = runCatching { sub.canRead() }.getOrDefault(false)
                 if (!readable) return@filter false
-                val markers = listOf("bin", "etc", "usr").count { marker ->
-                    runCatching { File(sub, marker).exists() }.getOrDefault(false)
-                }
-                markers >= 2 || sub.name in KNOWN_DROIDSPACES_DISTRO_DIRS
+                val hit = subMarkers(sub)
+                // ① 像正常 rootfs（2+ markers）
+                // ② 或者目录名像发行版（Ubuntu26 / debian12…）且至少有 1 个 marker
+                // ③ 或者 Droidspaces 要求的 /sbin/init 存在（目录型 rootfs 官方判据）
+                hit >= 2 ||
+                    (looksLikeKnownDistroName(sub.name) && hit >= 1) ||
+                    hasInit(sub)
             }
             .map { it.absolutePath }
             .sorted()
@@ -349,16 +430,23 @@ object TerminalContainerDetector {
     private fun detectEntryCapability(rootDir: File): TerminalContainerStatus.EntryCapability {
         val has = { rel: String ->
             val f = File(rootDir, rel.removePrefix("/"))
+            // File.exists() 默认跟随 symlink，这对 usrmerge（/bin -> /usr/bin）、
+            // sh -> dash/bash busybox link 等情况都够用。
             runCatching { f.exists() }.getOrDefault(false)
         }
-        if (!has("/bin/sh")) return TerminalContainerStatus.EntryCapability.NO_SHELL
-        if (has("/bin/unshare")) return TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE
-        if (has("/usr/sbin/chroot") || has("/bin/chroot")) {
+        // usrmerge 环境下 /bin/sh 和 /usr/bin/sh 等价；Droidspaces 的 Ubuntu/Debian 模板
+        // 通常都会放一个 /bin/sh（或指向 /bin/bash /bin/dash），但用户裁剪镜像时可能只放
+        // /usr/bin/sh，所以都查一下。
+        val hasShell = has("/bin/sh") || has("/usr/bin/sh")
+        if (!hasShell) return TerminalContainerStatus.EntryCapability.NO_SHELL
+        val hasUnshare = has("/bin/unshare") || has("/usr/bin/unshare")
+        if (hasUnshare) return TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE
+        if (has("/bin/chroot") || has("/usr/sbin/chroot") || has("/usr/bin/chroot")) {
             return TerminalContainerStatus.EntryCapability.CHROOT_ONLY
         }
-        // 有 sh 但找不到 unshare/chroot。这种情况下我们无法真的"切换根"，
-        // 标记为 NO_SHELL 太重了；退化为 CHROOT_ONLY 语义（命令执行阶段会给出缺工具
-        // 的明确错误），避免检测器和执行器两套判定差得太多。
+        // 有 sh 但找不到 unshare/chroot。执行阶段会走到 NO_ENTRY_AVAILABLE 错误模板；
+        // 这里保留 CHROOT_ONLY 语义，让 UI 把"缺入口工具"作为子项提示，而不是
+        // 一竿子打成 MISSING。
         return TerminalContainerStatus.EntryCapability.CHROOT_ONLY
     }
 
@@ -401,18 +489,25 @@ object TerminalContainerDetector {
             val f = File(rootDirFile, rel.removePrefix("/"))
             runCatching { f.exists() && f.canExecute() || (f.isFile && f.canRead()) }.getOrDefault(false)
         }
-        if (containerHas("/bin/unshare") || hostHas("unshare")) {
-            val bin = if (hostHas("unshare")) "宿主 unshare" else "容器 /bin/unshare"
+        val containerHasSh = containerHas("/bin/sh") || containerHas("/usr/bin/sh")
+        val containerHasUnshare = containerHas("/bin/unshare") || containerHas("/usr/bin/unshare")
+        if (containerHasUnshare || hostHas("unshare")) {
+            val bin = if (hostHas("unshare")) "宿主 unshare" else "容器 unshare"
             return "unshare namespace 根切换（$bin）"
         }
         val chrootBin = when {
             hostHas("chroot") -> "宿主 chroot"
             containerHas("/usr/sbin/chroot") -> "容器 /usr/sbin/chroot"
             containerHas("/bin/chroot") -> "容器 /bin/chroot"
+            containerHas("/usr/bin/chroot") -> "容器 /usr/bin/chroot"
             else -> null
         }
-        if (chrootBin != null && containerHas("/bin/sh")) {
+        if (chrootBin != null && containerHasSh) {
             return "chroot（$chrootBin）"
+        }
+        // 容器有 sh 但缺少 unshare/chroot（极少出现，比如只装了 busybox sh）。
+        if (containerHasSh) {
+            return "有 /bin/sh，但容器与宿主均缺少 unshare/chroot：无法真的切根"
         }
         return "入口未就绪（将以错误提示形式返回）"
     }

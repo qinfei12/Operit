@@ -246,6 +246,34 @@ internal object ContainerEntry {
     }
 
     /**
+     * 容器内入口文件存在判定：
+     * - 兼容 usrmerge（/bin /sbin 是 /usr/bin /usr/sbin 的 symlink），
+     *   所以每个工具都查 /bin/ + /usr/bin/ + 必要时 /usr/sbin/。
+     * - 不校验可执行位：很多 Android 壳文件系统（f2fs/ext4 通过 bind mount）
+     *   对非 root 的 canExecute() 会返回 false，但实际用 ROOT/Shizuku
+     *   权限执行时完全能用。所以只看 exists()（已跟随 symlink）。
+     */
+    private fun containerFileExists(rootFile: File, relative: String): Boolean {
+        val f = File(rootFile, relative.removePrefix("/"))
+        return runCatching { f.exists() }.getOrDefault(false)
+    }
+
+    private fun containerHasSh(rootFile: File): Boolean =
+        containerFileExists(rootFile, "/bin/sh") ||
+            containerFileExists(rootFile, "/usr/bin/sh")
+
+    private fun containerHasUnshare(rootFile: File): Boolean =
+        containerFileExists(rootFile, "/bin/unshare") ||
+            containerFileExists(rootFile, "/usr/bin/unshare")
+
+    private fun pickChrootInContainer(rootFile: File): String? {
+        if (containerFileExists(rootFile, "/usr/sbin/chroot")) return "/usr/sbin/chroot"
+        if (containerFileExists(rootFile, "/bin/chroot")) return "/bin/chroot"
+        if (containerFileExists(rootFile, "/usr/bin/chroot")) return "/usr/bin/chroot"
+        return null
+    }
+
+    /**
      * 探测入口模板。
      *
      * 注意：这里为了**不新增对"宿主 shell 执行链路"的耦合**（例如再次调用 RootAuthorizer 可能
@@ -259,34 +287,36 @@ internal object ContainerEntry {
      */
     private fun probeEntryTemplate(context: Context, rootDir: String): EntryTemplate {
         val rootFile = File(rootDir)
-        val containerHas = { relative: String ->
-            val f = File(rootFile, relative.removePrefix("/"))
-            runCatching { f.exists() && f.canExecute() || (f.isFile && f.canRead()) }.getOrDefault(false)
+        val hostHasUnshare = hostHasCommand("unshare")
+        val hostHasChroot = hostHasCommand("chroot")
+
+        val hasSh = containerHasSh(rootFile)
+        val hasUnshare = hostHasUnshare || containerHasUnshare(rootFile)
+        val chrootBin: String? = when {
+            hostHasChroot -> "chroot"
+            else -> pickChrootInContainer(rootFile)
+        }
+
+        val containerShPath = when {
+            containerFileExists(rootFile, "/usr/bin/sh") -> "/usr/bin/sh"
+            else -> "/bin/sh"
         }
 
         // 1) unshare 优先（真 namespace 隔离，再 chroot 进 rootfs）。
-        // unshare 可以来自宿主（android toolbox/toybox/第三方 /system/xbin）或容器内。
-        // 注意：实际是否能跑通取决于 ShellExecutor 的 ROOT/Shizuku debugger 权限，
-        // 这里不做任何兜底，执行失败时让 unshare/chroot 把 stderr 作为命令输出返回。
-        val hostHasUnshare = hostHasCommand("unshare")
-        val hostHasChroot = hostHasCommand("chroot")
-        if ((containerHas("/bin/unshare") || hostHasUnshare) && containerHas("/bin/sh")) {
+        // 必须同时有 shell 才能进入容器执行命令。
+        if (hasUnshare && hasSh) {
+            val unshareBin = if (hostHasUnshare) "unshare" else "/bin/unshare"
             AppLogger.d(
                 TAG,
-                "probeEntryTemplate: pick UNSHARE template (hostHasUnshare=$hostHasUnshare)"
+                "probeEntryTemplate: pick UNSHARE template via $unshareBin (sh=$containerShPath)"
             )
-            val unshareBin = if (hostHasUnshare) "unshare" else "/bin/unshare"
-            // unshare --mount --fork：获得新 mount 命名空间；chroot 到 rootfs；
-            // 在容器内挂 proc/sys/dev（若失败忽略，很多最小环境会缺 /proc 挂载）；
-            // cd 到逻辑 cwd；执行原命令。
-            // 说明：如果 unshare 是容器内的，意味着当前 sh 已经在宿主里看到了容器目录，
-            // 这种写法仍能通过 namespace + chroot 把命令重新切进去。
             return EntryTemplate(
                 template = buildString {
                     append(unshareBin)
                     append(" --mount --fork --pid ")
                     append("--root={ROOT} --wd={CWD} ")
-                    append("/bin/sh -lc ")
+                    append(containerShPath)
+                    append(" -lc ")
                     append("'")
                     append(
                         "mount -t proc proc /proc 2>/dev/null || true;" +
@@ -301,20 +331,13 @@ internal object ContainerEntry {
             )
         }
 
-        // 2) 退化为 chroot /bin/sh -lc "cd ... && ..."
-        // chroot 同样优先用宿主的（更通用），没有才尝试容器内的
-        val chrootBin = when {
-            hostHasChroot -> "chroot"
-            containerHas("/usr/sbin/chroot") -> "/usr/sbin/chroot"
-            containerHas("/bin/chroot") -> "/bin/chroot"
-            else -> null
-        }
-        if (chrootBin != null && containerHas("/bin/sh")) {
-            AppLogger.d(TAG, "probeEntryTemplate: pick CHROOT_SH template via $chrootBin")
+        // 2) 退化为 chroot。
+        if (chrootBin != null && hasSh) {
+            AppLogger.d(TAG, "probeEntryTemplate: pick CHROOT_SH template via $chrootBin (sh=$containerShPath)")
             return EntryTemplate(
                 template = buildString {
                     append("{ROOT_CHROOT_PREFIX}")
-                    append("$chrootBin {ROOT} /bin/sh -lc ")
+                    append("$chrootBin {ROOT} $containerShPath -lc ")
                     append("'cd {CWD} || true; {CMD}'")
                 },
                 needRoot = true,
@@ -322,21 +345,25 @@ internal object ContainerEntry {
             )
         }
 
-        // 3) 容器内连 /bin/sh 都没：显然不是合法 rootfs，直接给错误模板。
+        // 3) 缺 shell 或 缺切根工具 → 错误模板。
         val reason = buildString {
             append("容器内缺少可执行的外壳或入口工具，无法进入 rootfs。")
             append(" 容器目录=$rootDir;")
             append(" 已检查=host:unshare($hostHasUnshare),host:chroot($hostHasChroot);")
-            append(" container=/bin/unshare(${containerHas("/bin/unshare")}),")
-            append("/bin/sh(${containerHas("/bin/sh")}),")
-            append("/usr/sbin/chroot(${containerHas("/usr/sbin/chroot")}),")
-            append("/bin/chroot(${containerHas("/bin/chroot")}).")
-            append(" 请确认该目录为 Droidspaces 构建的完整 Linux rootfs，并安装基础 busybox/coreutils。")
+            append(" container sh($hasSh:")
+            append(" bin/sh=${containerFileExists(rootFile, "/bin/sh")},")
+            append(" usr/bin/sh=${containerFileExists(rootFile, "/usr/bin/sh")});")
+            append(" unshare=${hasUnshare};")
+            append(" chroot=$chrootBin。")
+            if (!hasSh) {
+                append(" 请在 Droidspaces 向导中选择「目录型 rootfs」完成完整安装，")
+                append("不要选到容器镜像的父目录或 /mnt/Droidspaces/ 本身。")
+            } else {
+                append(" 请确认 Shell 执行器的权限级别至少是 ROOT 或 DEBUGGER(Shizuku)，")
+                append("以便 unshare/chroot 能成功发起系统调用。")
+            }
         }
         AppLogger.w(TAG, "probeEntryTemplate: NO_ENTRY_AVAILABLE $reason")
-        // 注意：错误模板不能再引用容器内 /bin/sh（否则如果那路径本身就不存在，整条命令会失败成
-        // "sh: /bin/sh: No such file or directory"，用户看不到我们辛苦收集的原因）。
-        // 直接用宿主 sh（一定存在）echo 原因到 stderr，并以非 0 退出。
         return EntryTemplate(
             template = "sh -lc 'echo ${shellQuote(reason)} 1>&2; exit 23'",
             needRoot = false,
