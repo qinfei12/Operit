@@ -2,6 +2,8 @@ package com.ai.assistance.operit.core.tools.system
 
 import android.content.Context
 import com.ai.assistance.operit.util.AppLogger
+import com.ai.assistance.operit.core.tools.system.shell.ShellExecutor
+import com.ai.assistance.operit.core.tools.system.shell.ShellExecutorFactory
 import com.ai.assistance.operit.data.preferences.TerminalContainerPreferences
 import com.ai.assistance.operit.data.preferences.terminalContainerPreferences
 import java.io.File
@@ -57,6 +59,33 @@ data class TerminalContainerStatus(
 }
 
 /**
+ * 运行期进入容器所需的权限环境检测结果。
+ *
+ * 用于设置页展示"当前首选的 Shell 执行器 + 是否已授予"，
+ * 让用户能一眼区分"目录选对了但权限不够"和"目录就不对"两种情况。
+ */
+data class RuntimePermissionStatus(
+    /** 当前首选的权限级别。 */
+    val level: AndroidPermissionLevel,
+    /** 给 UI 直接展示的级别标签。 */
+    val levelLabel: String,
+    /** 该级别下，执行器是否真正获得了授权。 */
+    val granted: Boolean,
+    /** 未授权时的原因（例如 Shizuku 未启动、Root 未授予等），可能为空。 */
+    val reason: String?,
+) {
+    /** 中文 UI 友好的级别名称。 */
+    val levelLabelChinese: String
+        get() = when (level) {
+            AndroidPermissionLevel.ROOT -> "ROOT（su）"
+            AndroidPermissionLevel.DEBUGGER -> "DEBUGGER（Shizuku）"
+            AndroidPermissionLevel.ADMIN -> "ADMIN（设备所有者）"
+            AndroidPermissionLevel.ACCESSIBILITY -> "ACCESSIBILITY（无障碍）"
+            AndroidPermissionLevel.STANDARD -> "STANDARD（普通应用）"
+        }
+}
+
+/**
  * 终端容器（rootfs）检测器。
  *
  * 检测原则：
@@ -96,6 +125,35 @@ object TerminalContainerDetector {
                 }
         val rootDir = prefs.getContainerRootDir()
         return detectFor(context, rootDir)
+    }
+
+    /**
+     * 检测运行期进入容器的权限环境：当前首选 ShellExecutor 的权限级别，以及该级别下
+     * 是"已授予"还是"拒绝/未启动"。仅用于 UI 给用户更直观的提示，不参与容器目录本身
+     * 的就绪判定（避免执行期权限检测与静态目录检测耦合过重）。
+     */
+    fun detectRuntimePermission(context: Context): RuntimePermissionStatus {
+        val executor = runCatching {
+            ShellExecutorFactory.getUserPreferredExecutor(context)
+        }.getOrElse { error ->
+            AppLogger.w(TAG, "getUserPreferredExecutor failed", error)
+            return RuntimePermissionStatus(
+                level = AndroidPermissionLevel.STANDARD,
+                levelLabel = AndroidPermissionLevel.STANDARD.name,
+                granted = false,
+                reason = "获取首选执行器失败：${error.message}",
+            )
+        }
+        val permStatus = runCatching { executor.hasPermission() }.getOrElse { error ->
+            ShellExecutor.PermissionStatus.denied("hasPermission 异常：${error.message}")
+        }
+        val level = executor.getPermissionLevel()
+        return RuntimePermissionStatus(
+            level = level,
+            levelLabel = level.name,
+            granted = permStatus.granted,
+            reason = permStatus.reason,
+        )
     }
 
     fun detectFor(context: Context, rawRootDir: String?): TerminalContainerStatus {

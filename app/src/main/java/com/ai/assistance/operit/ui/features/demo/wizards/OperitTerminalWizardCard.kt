@@ -160,6 +160,25 @@ fun OperitTerminalWizardCard(
                         )
                     }
                 }
+                // 容器目录 OK 但入口文件或权限可能有坑，在这里用一行小字点明，
+                // 避免让用户在 "pnpm/pip 一直显示未安装" 这种现象里摸不清根因。
+                val entryHint = when (containerStatus.entryCapability) {
+                    TerminalContainerStatus.EntryCapability.NO_SHELL ->
+                        "⚠ 容器内缺 /bin/sh，命令无法执行。请重新选择真正的发行版 rootfs。"
+                    TerminalContainerStatus.EntryCapability.CHROOT_ONLY ->
+                        "ℹ 进入方式：chroot。需要在 Shell 权限设置中切到 ROOT 或 Shizuku（DEBUGGER），否则命令仍在宿主里跑。"
+                    TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE ->
+                        "ℹ 进入方式：unshare。需要在 Shell 权限设置中切到 ROOT 或 Shizuku（DEBUGGER），否则命令仍在宿主里跑。"
+                    TerminalContainerStatus.EntryCapability.UNKNOWN -> null
+                }
+                if (entryHint != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = entryHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Spacer(Modifier.height(8.dp))
             }
 

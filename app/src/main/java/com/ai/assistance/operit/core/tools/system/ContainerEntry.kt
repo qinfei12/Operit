@@ -182,6 +182,33 @@ object ContainerEntry {
 
     private val CD_PATTERN = Regex("""^cd\s+(.+?)\s*${'$'}""", RegexOption.DOT_MATCHES_ALL)
 
+    /**
+     * 在宿主 PATH + 常见工具目录中找一条命令。
+     * 注意：不使用 shell，只做静态文件存在判断（避免阻塞 prepareForSession）。
+     */
+    private fun hostHasCommand(name: String): Boolean {
+        val candidates = System.getenv("PATH")
+            .orEmpty()
+            .split(':')
+            .filter { it.isNotEmpty() }
+            .plus(
+                listOf(
+                    "/system/bin",
+                    "/system/xbin",
+                    "/vendor/bin",
+                    "/sbin",
+                    "/product/bin",
+                    "/apex/com.android.runtime/bin",
+                )
+            )
+            .distinct()
+        for (dir in candidates) {
+            val f = File(dir, name)
+            if (runCatching { f.isFile && f.canExecute() }.getOrDefault(false)) return true
+        }
+        return false
+    }
+
     private suspend fun resolveRootDirOrThrow(context: Context): String {
         val prefs = runCatching { terminalContainerPreferences }.getOrElse { err ->
             AppLogger.w(TAG, "resolveRootDir: preferences not initialized", err)
@@ -230,39 +257,52 @@ object ContainerEntry {
             runCatching { f.exists() && f.canExecute() || (f.isFile && f.canRead()) }.getOrDefault(false)
         }
 
-        // 1) unshare 优先（真 namespace 隔离，挂载 /proc /sys /dev 更接近真实 chroot）
-        if (containerHas("/bin/unshare") && containerHas("/bin/sh")) {
-            AppLogger.d(TAG, "probeEntryTemplate: pick UNSHARED_CHROOT_SH template")
-            // unshare 需要 root；这里不做 ROOT 兜底，没有就报给用户。
+        // 1) unshare 优先（真 namespace 隔离，再 chroot 进 rootfs）。
+        // unshare 可以来自宿主（android toolbox/toybox/第三方 /system/xbin）或容器内。
+        // 注意：实际是否能跑通取决于 ShellExecutor 的 ROOT/Shizuku debugger 权限，
+        // 这里不做任何兜底，执行失败时让 unshare/chroot 把 stderr 作为命令输出返回。
+        val hostHasUnshare = hostHasCommand("unshare")
+        val hostHasChroot = hostHasCommand("chroot")
+        if ((containerHas("/bin/unshare") || hostHasUnshare) && containerHas("/bin/sh")) {
+            AppLogger.d(
+                TAG,
+                "probeEntryTemplate: pick UNSHARE template (hostHasUnshare=$hostHasUnshare)"
+            )
+            val unshareBin = if (hostHasUnshare) "unshare" else "/bin/unshare"
+            // unshare --mount --fork：获得新 mount 命名空间；chroot 到 rootfs；
+            // 在容器内挂 proc/sys/dev（若失败忽略，很多最小环境会缺 /proc 挂载）；
+            // cd 到逻辑 cwd；执行原命令。
+            // 说明：如果 unshare 是容器内的，意味着当前 sh 已经在宿主里看到了容器目录，
+            // 这种写法仍能通过 namespace + chroot 把命令重新切进去。
             return EntryTemplate(
                 template = buildString {
-                    // 先 echo 一下准备的 cwd，方便排查；然后 unshare 进入，挂载 proc，执行命令。
-                    // 这里不要求宿主的 mount namespace 支持（那是 root/exec 能力决定的）。
-                    // 如果失败，unshare 会直接把错误打在 stderr，上层照常收集。
-                    append("{ROOT_CHROOT_PREFIX}")
+                    append(unshareBin)
+                    append(" --mount --fork --pid ")
+                    append("--root={ROOT} --wd={CWD} ")
                     append("/bin/sh -lc ")
                     append("'")
                     append(
                         "mount -t proc proc /proc 2>/dev/null || true;" +
                             " mount -t sysfs sys /sys 2>/dev/null || true;" +
                             " mount -t devtmpfs dev /dev 2>/dev/null || true;" +
-                            " cd {CWD} || true; " +
-                            "{CMD}"
+                            " {CMD}"
                     )
                     append("'")
                 },
                 needRoot = true,
-                source = "UNSHARED_CHROOT_SH",
+                source = "UNSHARE_NATIVE($unshareBin)",
             )
         }
 
         // 2) 退化为 chroot /bin/sh -lc "cd ... && ..."
-        val hasChroot = containerHas("/usr/sbin/chroot") || containerHas("/bin/chroot")
+        // chroot 同样优先用宿主的（更通用），没有才尝试容器内的
         val chrootBin = when {
+            hostHasChroot -> "chroot"
             containerHas("/usr/sbin/chroot") -> "/usr/sbin/chroot"
-            else -> "/bin/chroot"
+            containerHas("/bin/chroot") -> "/bin/chroot"
+            else -> null
         }
-        if (hasChroot && containerHas("/bin/sh")) {
+        if (chrootBin != null && containerHas("/bin/sh")) {
             AppLogger.d(TAG, "probeEntryTemplate: pick CHROOT_SH template via $chrootBin")
             return EntryTemplate(
                 template = buildString {
@@ -279,7 +319,8 @@ object ContainerEntry {
         val reason = buildString {
             append("容器内缺少可执行的外壳或入口工具，无法进入 rootfs。")
             append(" 容器目录=$rootDir;")
-            append(" 已检查=/bin/unshare(${containerHas("/bin/unshare")}),")
+            append(" 已检查=host:unshare($hostHasUnshare),host:chroot($hostHasChroot);")
+            append(" container=/bin/unshare(${containerHas("/bin/unshare")}),")
             append("/bin/sh(${containerHas("/bin/sh")}),")
             append("/usr/sbin/chroot(${containerHas("/usr/sbin/chroot")}),")
             append("/bin/chroot(${containerHas("/bin/chroot")}).")

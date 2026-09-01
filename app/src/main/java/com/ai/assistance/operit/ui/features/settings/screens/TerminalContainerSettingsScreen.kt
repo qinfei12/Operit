@@ -57,8 +57,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ai.assistance.operit.R
+import com.ai.assistance.operit.core.tools.system.AndroidPermissionLevel
 import com.ai.assistance.operit.core.tools.system.TerminalContainerDetector
 import com.ai.assistance.operit.core.tools.system.TerminalContainerStatus
+import com.ai.assistance.operit.core.tools.system.RuntimePermissionStatus
 import com.ai.assistance.operit.data.preferences.TerminalContainerPreferences
 import com.ai.assistance.operit.data.preferences.terminalContainerPreferences
 import com.ai.assistance.operit.util.AppLogger
@@ -99,6 +101,10 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
         mutableStateOf<TerminalContainerStatus?>(null)
     }
 
+    var runtimePermission by remember {
+        mutableStateOf<RuntimePermissionStatus?>(null)
+    }
+
     var scanning by remember { mutableStateOf(false) }
     var scannedCandidates by remember { mutableStateOf<List<String>>(emptyList()) }
     var showCandidateDialog by remember { mutableStateOf(false) }
@@ -108,6 +114,7 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
         prefs.containerRootDirFlow.collect { current ->
             savedRootDir = current
             detection = TerminalContainerDetector.detectFor(context, current)
+            runtimePermission = TerminalContainerDetector.detectRuntimePermission(context)
             if (!initialized) {
                 rootDirInput = current.ifBlank { TerminalContainerPreferences.DEFAULT_CONTAINER_ROOT_DIR }
                 initialized = true
@@ -117,6 +124,7 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
 
     fun rerunDetection(rootDir: String) {
         detection = TerminalContainerDetector.detectFor(context, rootDir)
+        runtimePermission = TerminalContainerDetector.detectRuntimePermission(context)
     }
 
     Scaffold(
@@ -283,6 +291,7 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
             // ===== 检测结果卡片 =====
             DetectionCard(
                 status = detection,
+                runtimePermission = runtimePermission,
                 onRescan = { rerunDetection(savedRootDir.ifBlank { rootDirInput }) },
             )
         }
@@ -304,6 +313,7 @@ fun TerminalContainerSettingsScreen(onBackPressed: () -> Unit) {
 @Composable
 private fun DetectionCard(
     status: TerminalContainerStatus?,
+    runtimePermission: RuntimePermissionStatus?,
     onRescan: () -> Unit,
 ) {
     if (status == null) {
@@ -393,6 +403,95 @@ private fun DetectionCard(
                     text = "提示：仅提示，不自动删除。请确认上述目录不再使用后手动清理。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            // ===== 入口方式 + 运行时权限（专门区分"目录对了但权限不够"） =====
+            val entry = status.entryCapability
+            if (entry != TerminalContainerStatus.EntryCapability.UNKNOWN || runtimePermission != null) {
+                Spacer(Modifier.height(4.dp))
+                Divider()
+                Spacer(Modifier.height(4.dp))
+                EntryAndPermissionRow(entry = entry, runtimePermission = runtimePermission)
+            }
+        }
+    }
+}
+
+@Composable
+private fun EntryAndPermissionRow(
+    entry: TerminalContainerStatus.EntryCapability,
+    runtimePermission: RuntimePermissionStatus?,
+) {
+    val (entryTitle, entryDesc, entryOk) = when (entry) {
+        TerminalContainerStatus.EntryCapability.NO_SHELL ->
+            Triple("入口文件：缺 /bin/sh", "无法进入容器，命令只会返回错误。", false)
+        TerminalContainerStatus.EntryCapability.CHROOT_ONLY ->
+            Triple("入口方式：chroot", "需要 ROOT 或 Shizuku debugger 权限才能真的切换根。", true)
+        TerminalContainerStatus.EntryCapability.UNSHARE_AVAILABLE ->
+            Triple("入口方式：unshare（优先）", "需要 ROOT 或 Shizuku debugger 权限才能真的进入隔离环境。", true)
+        TerminalContainerStatus.EntryCapability.UNKNOWN ->
+            Triple("入口方式：未知", "目录未就绪或还未做静态检测。", false)
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = entryTitle,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.width(8.dp))
+            AssistChip(
+                onClick = {},
+                label = {
+                    Text(
+                        text = if (entryOk) "具备" else "缺失",
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                },
+            )
+        }
+        Text(
+            text = entryDesc,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (runtimePermission != null) {
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "当前 Shell 权限：${runtimePermission.levelLabelChinese}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.width(8.dp))
+                AssistChip(
+                    onClick = {},
+                    label = {
+                        Text(
+                            text = if (runtimePermission.granted) "已授予" else "未授权",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    },
+                )
+            }
+            val permHint = when {
+                runtimePermission.granted -> null
+                runtimePermission.level == AndroidPermissionLevel.STANDARD ->
+                    "当前仅普通应用权限，无法真的 chroot/unshare 进入容器。请在 Shell 权限设置里切换到 ROOT 或 Shizuku（DEBUGGER）。"
+                runtimePermission.level == AndroidPermissionLevel.DEBUGGER ->
+                    "Shizuku 未启动或未授予 Operit 权限，按提示启动 Shizuku 后再回到此页重新检测。"
+                runtimePermission.level == AndroidPermissionLevel.ROOT ->
+                    "Root (su) 未授权或当前设备不支持 Root。如果使用 Shizuku，请改为 DEBUGGER 级别。"
+                else -> runtimePermission.reason?.trim()?.ifEmpty { null }
+            }
+            permHint?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFBF6F00),
                 )
             }
         }
