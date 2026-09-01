@@ -626,5 +626,4 @@ private fun CandidatePickerDialog(
             TextButton(onClick = onDismiss) { Text("取消") }
         },
     )
-    }
 }

@@ -31,8 +31,15 @@ import java.io.File
  *
  * 说明：TerminalManager 本身怎么起 PTY、怎么收集输出，不变；我们只把"sendCommand"这一步发送的
  * 字符串从原始命令改成"进入容器后再执行命令"。
+ *
+ * 【可见性说明】整个 object 声明为 `internal`：
+ * - 所有对它的调用都在同一个 Gradle 模块（app）内的 Terminal.kt 里，
+ *   限制为 internal 可以避免 Kotlin 编译器在严格 API 检查时报
+ *   `public function exposes its internal parameter type EntryTemplate/Prepared`
+ *   （因为 EntryTemplate / Prepared 中的字段只是模块内部实现细节，
+ *   不需要暴露给 UI / 数据层 / 插件层）。
  */
-object ContainerEntry {
+internal object ContainerEntry {
 
     private const val TAG = "ContainerEntry"
 

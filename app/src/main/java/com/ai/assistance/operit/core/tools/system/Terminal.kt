@@ -262,10 +262,15 @@ class Terminal private constructor(private val context: Context) {
             .andThen { runCatching { terminalManager.sendCommandToSession(sessionId, wrapped, commandId) } }
 
         if (sendResult.isFailure) {
+            // exceptionOrNull() 类型是 Throwable?。
+            // 这里理论上 isFailure → exceptionOrNull() 一定非空，但 Kotlin 编译器不会自动 narrow，
+            // 所以取 ?: fallback，保证传给 AppLogger.e、deferred 的值都符合非空签名，
+            // 避免 compileNightlyKotlin 报告 "actual type is Throwable?" 错误。
             val error = sendResult.exceptionOrNull()
+                ?: IllegalStateException("send failed without exception info")
             AppLogger.e(TAG, "executeCommand send failed", error)
             if (!deferred.isCompleted) {
-                deferred.complete("命令发送失败：${error?.message ?: error?.javaClass?.simpleName.orEmpty()}")
+                deferred.complete("命令发送失败：${error.message ?: error.javaClass.simpleName}")
             }
         }
 
