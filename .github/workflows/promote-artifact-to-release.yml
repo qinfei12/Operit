@@ -1,0 +1,212 @@
+name: Promote Artifact to Release Draft
+# 用途：把已经编译好的 workflow artifact（APK）搬运到 GitHub Release Draft，
+#       完全不重新编译，只在 runner 内部下载 artifact + 创建 release + 上传 APK。
+# runner 到 GitHub 是内网带宽，430MB 只需要几秒。
+#
+# 触发方式：workflow_dispatch 手动触发，指定 run_id 和 artifact_name。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "要搬运的 workflow run ID（例如 33588889504）"
+        required: true
+        type: string
+      artifact_name:
+        description: "artifact 名称（例如 operit-android-6），留空自动取第一个"
+        required: false
+        type: string
+        default: ""
+      tag_name:
+        description: "目标 Release Tag（例如 debug-build-6-c7eb1fd），留空自动生成"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: promote-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  promote:
+    name: Promote APK artifact to Release Draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve run metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_ID="${{ inputs.run_id }}"
+          echo "run_id=$RUN_ID"
+
+          # 拿 run 的信息
+          RUN_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID")"
+          HEAD_SHA="$(echo "$RUN_JSON"       | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_sha"])')"
+          HEAD_BRANCH="$(echo "$RUN_JSON"   | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_branch"])')"
+          RUN_NUMBER="$(echo "$RUN_JSON"    | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_number"])')"
+          EVENT="$(echo "$RUN_JSON"         | python3 -c 'import json,sys; print(json.load(sys.stdin)["event"])')"
+          CONCLUSION="$(echo "$RUN_JSON"    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("conclusion") or "pending")')"
+          COMMIT_SHORT="${HEAD_SHA:0:7}"
+
+          echo "  head_sha     = $HEAD_SHA"
+          echo "  head_branch  = $HEAD_BRANCH"
+          echo "  run_number   = $RUN_NUMBER"
+          echo "  event        = $EVENT"
+          echo "  conclusion   = $CONCLUSION"
+          echo "  commit_short = $COMMIT_SHORT"
+
+          if [ "$CONCLUSION" != "success" ] && [ "$CONCLUSION" != "skipped" ]; then
+            echo "::warning::Run $RUN_ID conclusion=$CONCLUSION, 仍继续尝试（artifact 可能已经上传）"
+          fi
+
+          # 列 artifact，找目标
+          ARTS_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/$RUN_ID/artifacts")"
+          echo "$ARTS_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(f'  artifact count = {data[\"total_count\"]}')
+for a in data.get('artifacts', []):
+    size_mb = a['size_in_bytes'] / 1024 / 1024
+    print(f'    - id={a[\"id\"]} name={a[\"name\"]} size={size_mb:.1f} MB expired={a[\"expired\"]}')
+"
+
+          WANTED_ARTIFACT="${{ inputs.artifact_name }}"
+          if [ -z "$WANTED_ARTIFACT" ]; then
+            WANTED_ARTIFACT="$(echo "$ARTS_JSON" | python3 -c '
+import json, sys
+arts = json.load(sys.stdin).get("artifacts", [])
+# 选第一个没过期的，没有就第一个
+cands = [a for a in arts if not a.get("expired", True)]
+pick = (cands or arts or [{}])[0].get("name", "")
+print(pick)
+')"
+          fi
+          if [ -z "$WANTED_ARTIFACT" ]; then
+            echo "::error::No usable artifact found for run $RUN_ID"
+            exit 1
+          fi
+          echo "Picked artifact: $WANTED_ARTIFACT"
+
+          # 决定 tag name
+          TAG="${{ inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="debug-build-${RUN_NUMBER}-${COMMIT_SHORT}"
+          fi
+          echo "Tag: $TAG"
+          RELEASE_NAME="Debug Build #${RUN_NUMBER} (${COMMIT_SHORT})"
+
+          echo "head_sha=$HEAD_SHA"       >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "run_number=$RUN_NUMBER"   >> "$GITHUB_OUTPUT"
+          echo "artifact=$WANTED_ARTIFACT">> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "commit_short=$COMMIT_SHORT" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download artifact (APK)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/apks
+          gh run download "${{ inputs.run_id }}" \
+            --name "${{ steps.meta.outputs.artifact }}" \
+            --dir /tmp/apks \
+            --repo "${GITHUB_REPOSITORY}"
+          echo "=== 下载结果 ==="
+          find /tmp/apks -type f -printf "%s %p\n" | sort -nr | awk '{printf "  %6.1f MB  %s\n", $1/1024/1024, $2}'
+          echo "=== 仅 APK ==="
+          find /tmp/apks -name "*.apk" -type f -printf "%s %p\n" | sort -nr | awk '{printf "  %6.1f MB  %s\n", $1/1024/1024, $2}'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create / update Release Draft and upload APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.meta.outputs.tag }}"
+          RELEASE_NAME="${{ steps.meta.outputs.release_name }}"
+          COMMIT_SHORT="${{ steps.meta.outputs.commit_short }}"
+          HEAD_SHA="${{ steps.meta.outputs.head_sha }}"
+          HEAD_BRANCH="${{ steps.meta.outputs.head_branch }}"
+          RUN_NUMBER="${{ steps.meta.outputs.run_number }}"
+
+          # 1. 收集所有 APK
+          mapfile -t APK_FILES < <(find /tmp/apks -name "*.apk" -type f -printf "%s %p\n" | sort -nr | awk '{print $2}')
+          if [ ${#APK_FILES[@]} -eq 0 ]; then
+            echo "::error::No APK files found in artifact. Aborting."
+            exit 2
+          fi
+          echo "准备上传 ${#APK_FILES[@]} 个 APK："
+          for apk in "${APK_FILES[@]}"; do
+            SIZE_MB=$(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$apk")/1024/1024}")
+            echo "  - $(basename "$apk") (${SIZE_MB} MB)"
+          done
+
+          # 2. 写 release notes
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## 自动构建的 Debug APK（从 artifact 搬运，未重新编译）"
+            echo ""
+            echo "- Workflow Run: [#${RUN_NUMBER}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${{ inputs.run_id }})"
+            echo "- Commit: \`${HEAD_SHA}\` (分支 \`${HEAD_BRANCH}\`，短哈希 \`${COMMIT_SHORT}\`)"
+            echo "- Build time (UTC): \`$(date -u '+%Y-%m-%d %H:%M:%S')\`"
+            echo ""
+            echo "### APK 列表"
+            for apk in "${APK_FILES[@]}"; do
+              SIZE_MB=$(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$apk")/1024/1024}")
+              echo "- \`$(basename "$apk")\` (${SIZE_MB} MB)"
+            done
+            echo ""
+            echo "> 说明：本 Release 由 promote-artifact-to-release 工作流生成，"
+            echo "> 没有重新编译 Android 项目，仅把已有的 artifact 搬迁为 Release Asset，"
+            echo "> 方便通过直链加速下载。"
+          } > "$NOTES_FILE"
+          echo "--- release notes ---"
+          cat "$NOTES_FILE"
+          echo "---------------------"
+
+          # 3. 如果 draft 已存在，先删掉里面老的 APK asset 再重新上传（幂等）
+          EXISTING_URL=""
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，清除已有 APK 资产后更新（保留 draft 状态）"
+            EXISTING_URL="$(gh release view "$TAG" --json url -q '.url')"
+            for apk in "${APK_FILES[@]}"; do
+              gh release delete-asset -y "$TAG" "$(basename "$apk")" 2>/dev/null || true
+            done
+            # 更新 notes 和标题
+            gh release edit "$TAG" \
+              --title "$RELEASE_NAME" \
+              --notes-file "$NOTES_FILE" \
+              --draft
+          else
+            echo "创建新的 draft release: $TAG"
+            gh release create "$TAG" \
+              --draft \
+              --title "$RELEASE_NAME" \
+              --notes-file "$NOTES_FILE" \
+              --target "$HEAD_BRANCH"
+          fi
+
+          # 4. 上传 APK
+          for apk in "${APK_FILES[@]}"; do
+            echo "Uploading $apk ..."
+            gh release upload "$TAG" "$apk" --clobber
+          done
+
+          echo ""
+          echo "✅ 完成"
+          echo "   Tag: $TAG"
+          echo "   URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
