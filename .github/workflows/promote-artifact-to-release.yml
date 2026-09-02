@@ -33,6 +33,14 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Checkout (minimal, 只为 gh release 提供 git 上下文)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
       - name: Resolve run metadata
         id: meta
         shell: bash
