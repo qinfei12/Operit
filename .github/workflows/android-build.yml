@@ -50,7 +50,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   JAVA_VERSION: '21'
@@ -234,3 +234,71 @@ jobs:
             app/build/outputs/bundle/**/*.aab
           if-no-files-found: error
           retention-days: 14
+
+      # 自动创建 GitHub Release Draft 并上传 APK，避免 artifact 下载龟速
+      - name: Create GitHub Release Draft with APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. 找所有 APK 文件，按大小排序，选最大的那个作为主 APK
+          mapfile -t APK_FILES < <(find app/build/outputs/apk -name "*.apk" -printf "%s %p\n" | sort -nr | awk '{print $2}')
+          if [ ${#APK_FILES[@]} -eq 0 ]; then
+            echo "::warning::No APK files found, skipping release draft."
+            exit 0
+          fi
+          echo "Found APK files:"
+          ls -lh "${APK_FILES[@]}"
+
+          # 2. 构造 tag / release 名称
+          COMMIT_SHORT="$(git rev-parse --short HEAD)"
+          TAG_NAME="debug-build-${{ github.run_number }}-${COMMIT_SHORT}"
+          RELEASE_NAME="Debug Build #${{ github.run_number }} (${COMMIT_SHORT})"
+
+          # 3. 生成 release body
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## 自动构建的 Debug APK"
+            echo ""
+            echo "- Workflow Run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "- Commit: \`${COMMIT_SHORT}\`"
+            echo "- Branch: \`${{ github.ref_name }}\`"
+            echo "- Build time (UTC): \`$(date -u '+%Y-%m-%d %H:%M:%S')\`"
+            echo ""
+            echo "### APK 列表"
+            for apk in "${APK_FILES[@]}"; do
+              SIZE="$(du -h "$apk" | awk '{print $1}')"
+              echo "- \`$(basename "$apk")\` (${SIZE})"
+            done
+          } > "$NOTES_FILE"
+          echo "--- Release notes ---"
+          cat "$NOTES_FILE"
+          echo "---------------------"
+
+          # 4. 用 gh CLI 创建 draft release 并上传 APK
+          # 若 tag 已存在，直接复用（幂等）
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release/tag $TAG_NAME already exists, deleting old assets before re-upload."
+            for apk in "${APK_FILES[@]}"; do
+              gh release delete-asset -y "$TAG_NAME" "$(basename "$apk")" 2>/dev/null || true
+            done
+          else
+            echo "Creating new draft release with tag $TAG_NAME ..."
+            gh release create "$TAG_NAME" \
+              --draft \
+              --title "$RELEASE_NAME" \
+              --notes-file "$NOTES_FILE" \
+              --target "$COMMIT_SHORT"
+          fi
+
+          # 5. 逐个上传 APK 作为 release asset
+          for apk in "${APK_FILES[@]}"; do
+            echo "Uploading: $apk"
+            gh release upload "$TAG_NAME" "$apk" --clobber
+          done
+
+          echo "✅ Release draft created: $TAG_NAME"
+          echo "   URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
