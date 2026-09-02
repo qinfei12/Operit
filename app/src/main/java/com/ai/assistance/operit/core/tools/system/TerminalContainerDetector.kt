@@ -555,16 +555,27 @@ object TerminalContainerDetector {
 
     private fun collectLegacyRootfsPaths(context: Context): List<String> {
         val candidates = listOfNotNull(
-            // 旧 PathMapper 写死的内置路径
             runCatching {
                 File(context.filesDir, "usr/var/lib/proot-distro/installed-rootfs/ubuntu")
             }.getOrNull(),
-            // 常见的 proot-distro 全部 rootfs 目录
             runCatching {
                 File(context.filesDir, "usr/var/lib/proot-distro/installed-rootfs")
             }.getOrNull(),
         )
+        // 只把"真正有 rootfs 内容"的旧路径报为冲突——空目录/自动生成的占位目录不算。
+        // 因为 Operit 启动时总会在 filesDir 下创建 proot-distro 的空目录骨架，
+        // 这些目录本身不是可用 rootfs，只是占位，不应该和用户选的 Droidspaces 容器冲突。
         return candidates.filter { runCatching { it.exists() }.getOrDefault(false) }
+            .filter { legacy ->
+                // 空目录或只有占位文件（busybox / .placeholder / .operit_installed_ok）
+                // 视为"不存在"，不报冲突
+                val children = runCatching { legacy.listFiles()?.size ?: 0 }.getOrDefault(0)
+                if (children == 0) return@filter false
+                // 有 bin/etc/usr 这些 rootfs 标志才算真正的 rootfs
+                listOf("bin", "etc", "usr", "sbin").any { marker ->
+                    runCatching { File(legacy, marker).exists() }.getOrDefault(false)
+                }
+            }
             .map { it.absolutePath }
     }
 
