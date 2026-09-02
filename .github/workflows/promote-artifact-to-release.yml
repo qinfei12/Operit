@@ -75,14 +75,18 @@ jobs:
               tag = f"debug-build-{run_number}-{commit_short}"
           release_name = f"Debug Build #{run_number} ({commit_short})"
           with open(out_path, "w", encoding="utf-8") as f:
-              f.write(f"HEAD_SHA={head_sha}\n")
-              f.write(f"HEAD_BRANCH={head_branch}\n")
-              f.write(f"RUN_NUMBER={run_number}\n")
-              f.write(f"CONCLUSION={conclusion}\n")
-              f.write(f"COMMIT_SHORT={commit_short}\n")
-              f.write(f"ARTIFACT={wanted}\n")
-              f.write(f"TAG={tag}\n")
-              f.write(f"RELEASE_NAME={release_name}\n")
+              # 加引号 + sh-escape，避免含空格/井号/括号的值被 shell 误解
+              import shlex
+              def shv(v: str) -> str:
+                  return shlex.quote(v if v is not None else "")
+              f.write(f"HEAD_SHA={shv(head_sha)}\n")
+              f.write(f"HEAD_BRANCH={shv(head_branch)}\n")
+              f.write(f"RUN_NUMBER={shv(str(run_number))}\n")
+              f.write(f"CONCLUSION={shv(conclusion)}\n")
+              f.write(f"COMMIT_SHORT={shv(commit_short)}\n")
+              f.write(f"ARTIFACT={shv(wanted)}\n")
+              f.write(f"TAG={shv(tag)}\n")
+              f.write(f"RELEASE_NAME={shv(release_name)}\n")
           # 再把概览打到 stdout（仅供日志看）
           print(f"  head_sha     = {head_sha}")
           print(f"  head_branch  = {head_branch}")
