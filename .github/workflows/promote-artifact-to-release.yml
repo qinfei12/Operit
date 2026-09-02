@@ -235,8 +235,7 @@ jobs:
             gh release create "$TAG" \
               --draft \
               --title "$RELEASE_NAME" \
-              --notes-file "$NOTES_FILE" \
-              --target "$HEAD_BRANCH"
+              --notes-file "$NOTES_FILE"
           fi
 
           for apk in "${APK_FILES[@]}"; do
