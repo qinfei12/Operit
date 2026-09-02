@@ -429,7 +429,7 @@ object TerminalContainerDetector {
                         append("容器目录校验通过：$dirPath")
                         if (entryCapability == TerminalContainerStatus.EntryCapability.NO_SHELL) {
                             append("｜但入口缺少 /bin/sh 或 /usr/bin/sh，")
-                            append("实际执行命令时会提示"无法进入容器"。请在 Droidspaces 里把 rootfs 完整安装好。")
+                            append("实际执行命令时会提示『无法进入容器』。请在 Droidspaces 里把 rootfs 完整安装好。")
                         }
                     }
                 }
